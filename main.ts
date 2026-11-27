@@ -1,991 +1,844 @@
-// PNG squeeze R9 — fresh build from the prose briefs (R5 leaders, R6, R7, R8, R9).
-// Colour forms + palette orderings, Viterbi/strip/band filter contest over hybrid
-// entropy+lazy-match costs, per-row brute force, hash-chain finder with row-above
-// probes, forward-DP optimal parse with iterated Huffman costs (dual basins),
-// run-aware block splitting/merging, length-limited Huffman trees (clamp+Kraft
-// repair, exact Kraft validated), one shared bit writer, dynamic-vs-fixed blocks.
-// Deterministic: fixed budgets, no clock, no Math.random.
+// PNG squeeze R10: forms + filter contest + custom DEFLATE (dual-index tree finder,
+// optimal-parse DP with cost-table refinement, package-merge Huffman).
+// Written from the R5-R10 briefs alone. Deterministic: fixed budgets, no clock/random.
 import { readFileSync, writeFileSync, mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { inflateSync, deflateRawSync, deflateSync } from 'node:zlib';
+import { inflateSync, deflateSync } from 'node:zlib';
 
-const NODE = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const OUTD = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const I = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const DIAG = false;
+const W = 1280, H = 720, N = W * H;
+const ITERS_FLAT = 12, ITERS_RICH = 12, DEPTH_FLAT = 48, DEPTH_RICH = 32;
 
-// ---------- DEFLATE tables ----------
-const LEN_BASE = [3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258];
-const LEN_EXTRA = [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0];
-const DIST_BASE = [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577];
-const DIST_EXTRA = [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13];
-function lenSym(len) { // length -> symbol 257..285
-  if (len >= 258) return 285;
-  for (let s = 0; s < 29; s++) {
-    const lo = LEN_BASE[s], hi = lo + (LEN_EXTRA[s] ? (1 << LEN_EXTRA[s]) - 1 : 0);
-    if (len >= lo && len <= hi) return 257 + s;
-  }
-  return 285;
-}
-function distSym(d) {
-  for (let s = 0; s < 30; s++) {
-    const lo = DIST_BASE[s], hi = lo + (DIST_EXTRA[s] ? (1 << DIST_EXTRA[s]) - 1 : 0);
-    if (d >= lo && d <= hi) return s;
-  }
-  return 29;
-}
-const CL_ORDER = [16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15];
-const LEN_SYM_TAB = new Uint16Array(259);
-for (let l = 3; l <= 258; l++) LEN_SYM_TAB[l] = lenSym(l);
-const DIST_SYM_TAB = new Uint8Array(32769);
-for (let d = 1; d <= 32768; d++) DIST_SYM_TAB[d] = distSym(d);
-const FIXED_LIT = new Uint8Array(288);
-for (let i = 0; i < 288; i++) FIXED_LIT[i] = i < 144 ? 8 : i < 256 ? 9 : i < 280 ? 7 : 8;
-const FIXED_DIST = new Uint8Array(30).fill(5);
-
-// ---------- CRC / Adler ----------
-const CRC_T = (() => { const t = new Int32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c; } return t; })();
-function crc32(b, s, e) { let c = -1; for (let i = s; i < e; i++) c = CRC_T[(c ^ b[i]) & 255] ^ (c >>> 8); return (c ^ -1) >>> 0; }
-function adler32(b) { let a = 1, c = 0; for (let i = 0; i < b.length;) { const e = Math.min(b.length, i + 5552); for (; i < e; i++) { a += b[i]; c += a; } a %= 65521; c %= 65521; } return ((c << 16) | a) >>> 0; }
-function chunk(type, data) {
-  const out = new Uint8Array(12 + data.length);
-  const v = new DataView(out.buffer);
+const CRC = (() => { const t = new Int32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c; } return t; })();
+function crc32(b: Uint8Array, s: number, e: number): number { let c = -1; for (let i = s; i < e; i++) c = CRC[(c ^ b[i]) & 255] ^ (c >>> 8); return (c ^ -1) >>> 0; }
+function adler32(b: Uint8Array): number { let a = 1, c = 0; for (let i = 0; i < b.length;) { const end = Math.min(b.length, i + 5552); for (; i < end; i++) { a += b[i]; c += a; } a %= 65521; c %= 65521; } return ((c << 16) | a) >>> 0; }
+function chunk(type: string, data: Uint8Array): Uint8Array {
+  const out = new Uint8Array(12 + data.length); const v = new DataView(out.buffer);
   v.setUint32(0, data.length);
   for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
-  out.set(data, 8);
-  v.setUint32(8 + data.length, crc32(out, 4, 8 + data.length));
-  return out;
+  out.set(data, 8); v.setUint32(8 + data.length, crc32(out, 4, 8 + data.length)); return out;
 }
-function pngOf(chunks) {
-  const sig = Uint8Array.of(137,80,78,71,13,10,26,10);
-  let size = 8; for (const c of chunks) size += c.length;
-  const out = new Uint8Array(size); out.set(sig, 0);
-  let at = 8; for (const c of chunks) { out.set(c, at); at += c.length; }
-  return out;
+function ihdr(ct: number): Uint8Array { const d = new Uint8Array(13); const v = new DataView(d.buffer); v.setUint32(0, W); v.setUint32(4, H); d[8] = 8; d[9] = ct; return d; }
+function pngOf(parts: Uint8Array[]): Uint8Array {
+  const sig = Uint8Array.of(137, 80, 78, 71, 13, 10, 26, 10);
+  let sz = sig.length; for (const p of parts) sz += p.length;
+  const out = new Uint8Array(sz); out.set(sig); let at = sig.length;
+  for (const p of parts) { out.set(p, at); at += p.length; } return out;
 }
-function ihdrOf(w, h, ct) { const d = new Uint8Array(13); const v = new DataView(d.buffer); v.setUint32(0, w); v.setUint32(4, h); d[8] = 8; d[9] = ct; return d; }
+function paeth(a: number, b: number, c: number): number { const p = a + b - c; const pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c); if (pa <= pb && pa <= pc) return a; return pb <= pc ? b : c; }
 
-// ---------- PNG decode to RGBA ----------
-function paeth(a, b, c) { const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c); return pa <= pb && pa <= pc ? a : pb <= pc ? b : c; }
-function decodePng(bytes) {
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  let at = 8, header = null, palette = null, trns = null; const idat = [];
-  while (at < bytes.length) {
-    const len = view.getUint32(at);
-    const type = String.fromCharCode(bytes[at+4], bytes[at+5], bytes[at+6], bytes[at+7]);
-    const data = bytes.subarray(at + 8, at + 8 + len); at += 12 + len;
-    if (type === 'IHDR') { const dv = new DataView(data.buffer, data.byteOffset, 13); header = { w: dv.getUint32(0), h: dv.getUint32(4), ct: data[9] }; }
-    else if (type === 'PLTE') palette = data;
-    else if (type === 'tRNS') trns = data;
+function decode(buf: Uint8Array): Uint8Array {
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  let at = 8; const idat: Uint8Array[] = []; let ct = 6;
+  while (at < buf.length) {
+    const len = view.getUint32(at); const type = String.fromCharCode(buf[at + 4], buf[at + 5], buf[at + 6], buf[at + 7]);
+    const data = buf.subarray(at + 8, at + 8 + len); at += 12 + len;
+    if (type === 'IHDR') ct = data[9];
     else if (type === 'IDAT') idat.push(data);
     else if (type === 'IEND') break;
   }
-  const { w, h, ct } = header;
-  const ch = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 }[ct];
-  const stride = w * ch;
-  const raw = inflateSync(Buffer.concat(idat.map(x => Buffer.from(x))));
-  const samples = new Uint8Array(h * stride);
-  for (let y = 0; y < h; y++) {
-    const ft = raw[y * (stride + 1)], src = y * (stride + 1) + 1, o = y * stride, p = o - stride;
-    for (let i = 0; i < stride; i++) {
-      const v = raw[src + i];
-      if (ft === 0) samples[o+i] = v;
-      else if (ft === 1) samples[o+i] = v + (i >= ch ? samples[o+i-ch] : 0);
-      else if (ft === 2) samples[o+i] = v + (y > 0 ? samples[p+i] : 0);
-      else if (ft === 3) samples[o+i] = v + (((i >= ch ? samples[o+i-ch] : 0) + (y > 0 ? samples[p+i] : 0)) >> 1);
-      else { const a = i >= ch ? samples[o+i-ch] : 0, b = y > 0 ? samples[p+i] : 0, c = y > 0 && i >= ch ? samples[p+i-ch] : 0; samples[o+i] = v + paeth(a, b, c); }
-    }
+  const raw = inflateSync(idat.length === 1 ? idat[0] : Buffer.concat(idat));
+  const bpp = ct === 6 ? 4 : ct === 2 ? 3 : ct === 0 ? 1 : ct === 4 ? 2 : 1;
+  const stride = W * bpp; const samples = new Uint8Array(N * bpp);
+  for (let y = 0; y < H; y++) {
+    const ft = raw[y * (stride + 1)]; const src = y * (stride + 1) + 1; const o = y * stride; const p = o - stride;
+    if (ft === 0) samples.set(raw.subarray(src, src + stride), o);
+    else if (ft === 1) { for (let i = 0; i < stride; i++) samples[o + i] = raw[src + i] + (i >= bpp ? samples[o + i - bpp] : 0); }
+    else if (ft === 2) { for (let i = 0; i < stride; i++) samples[o + i] = raw[src + i] + (y > 0 ? samples[p + i] : 0); }
+    else if (ft === 3) { for (let i = 0; i < stride; i++) samples[o + i] = raw[src + i] + (((i >= bpp ? samples[o + i - bpp] : 0) + (y > 0 ? samples[p + i] : 0)) >> 1); }
+    else { for (let i = 0; i < stride; i++) { const a = i >= bpp ? samples[o + i - bpp] : 0; const b = y > 0 ? samples[p + i] : 0; const c = y > 0 && i >= bpp ? samples[p + i - bpp] : 0; samples[o + i] = raw[src + i] + paeth(a, b, c); } }
   }
-  const n = w * h, rgba = new Uint8Array(n * 4);
-  if (ct === 6) rgba.set(samples);
-  else if (ct === 2) { const key = trns ? (trns[1] << 16) | (trns[3] << 8) | trns[5] : -1; for (let i = 0, s = 0, d = 0; i < n; i++, s += 3, d += 4) { rgba[d]=samples[s]; rgba[d+1]=samples[s+1]; rgba[d+2]=samples[s+2]; rgba[d+3] = ((samples[s]<<16)|(samples[s+1]<<8)|samples[s+2]) === key ? 0 : 255; } }
-  else if (ct === 0) { const key = trns ? trns[1] : -1; for (let i = 0, d = 0; i < n; i++, d += 4) { const g = samples[i]; rgba[d]=rgba[d+1]=rgba[d+2]=g; rgba[d+3] = g === key ? 0 : 255; } }
-  else if (ct === 4) { for (let i = 0, s = 0, d = 0; i < n; i++, s += 2, d += 4) { rgba[d]=rgba[d+1]=rgba[d+2]=samples[s]; rgba[d+3]=samples[s+1]; } }
-  else { const lut = new Uint8Array((palette.length/3) * 4); for (let e = 0; e < palette.length/3; e++) { lut[e*4]=palette[e*3]; lut[e*4+1]=palette[e*3+1]; lut[e*4+2]=palette[e*3+2]; lut[e*4+3] = trns && e < trns.length ? trns[e] : 255; } for (let i = 0, d = 0; i < n; i++, d += 4) { const e = samples[i]; rgba[d]=lut[e*4]; rgba[d+1]=lut[e*4+1]; rgba[d+2]=lut[e*4+2]; rgba[d+3]=lut[e*4+3]; } }
-  return { w, h, rgba };
+  if (ct === 6) return samples;
+  const rgba = new Uint8Array(N * 4);
+  if (ct === 2) { for (let i = 0, s = 0, d = 0; i < N; i++, s += 3, d += 4) { rgba[d] = samples[s]; rgba[d + 1] = samples[s + 1]; rgba[d + 2] = samples[s + 2]; rgba[d + 3] = 255; } }
+  else if (ct === 0) { for (let i = 0, d = 0; i < N; i++, d += 4) { const g = samples[i]; rgba[d] = rgba[d + 1] = rgba[d + 2] = g; rgba[d + 3] = 255; } }
+  else { for (let i = 0, s = 0, d = 0; i < N; i++, s += 2, d += 4) { const g = samples[s]; rgba[d] = rgba[d + 1] = rgba[d + 2] = g; rgba[d + 3] = samples[s + 1]; } }
+  return rgba;
 }
 
-// ---------- filters ----------
-function filterRow(type, cur, prev, bpp, out) {
+function filterRow(type: number, cur: Uint8Array, prev: Uint8Array | null, bpp: number, out: Uint8Array): void {
   const n = cur.length;
   if (type === 0) out.set(cur);
-  else if (type === 1) { for (let i = 0; i < n; i++) out[i] = cur[i] - (i >= bpp ? cur[i-bpp] : 0); }
+  else if (type === 1) { for (let i = 0; i < n; i++) out[i] = cur[i] - (i >= bpp ? cur[i - bpp] : 0); }
   else if (type === 2) { for (let i = 0; i < n; i++) out[i] = cur[i] - (prev ? prev[i] : 0); }
-  else if (type === 3) { for (let i = 0; i < n; i++) out[i] = cur[i] - (((i >= bpp ? cur[i-bpp] : 0) + (prev ? prev[i] : 0)) >> 1); }
-  else { for (let i = 0; i < n; i++) { const a = i >= bpp ? cur[i-bpp] : 0, b = prev ? prev[i] : 0, c = prev && i >= bpp ? prev[i-bpp] : 0; out[i] = cur[i] - paeth(a, b, c); } }
+  else if (type === 3) { for (let i = 0; i < n; i++) out[i] = cur[i] - (((i >= bpp ? cur[i - bpp] : 0) + (prev ? prev[i] : 0)) >> 1); }
+  else { for (let i = 0; i < n; i++) { const a = i >= bpp ? cur[i - bpp] : 0; const b = prev ? prev[i] : 0; const c = prev && i >= bpp ? prev[i - bpp] : 0; out[i] = cur[i] - paeth(a, b, c); } }
 }
-function signedSum(row) { let s = 0; for (let i = 0; i < row.length; i++) { const v = row[i]; s += v < 128 ? v : 256 - v; } return s; }
-function buildFiltered(samples, w, h, bpp) {
-  const stride = w * bpp, F = [];
-  for (let t = 0; t < 5; t++) {
-    const raw = new Uint8Array(h * (stride + 1));
-    const tmp = new Uint8Array(stride);
-    for (let y = 0; y < h; y++) {
-      const cur = samples.subarray(y*stride, (y+1)*stride), prev = y ? samples.subarray((y-1)*stride, y*stride) : null;
-      filterRow(t, cur, prev, bpp, tmp);
-      raw[y*(stride+1)] = t; raw.set(tmp, y*(stride+1)+1);
-    }
-    F.push(raw);
-  }
-  return F;
-}
-function streamFromSeq(F, seq, w, h, bpp) {
-  const stride = w * bpp, raw = new Uint8Array(h * (stride + 1));
-  for (let y = 0; y < h; y++) { const t = seq[y]; raw[y*(stride+1)] = t; raw.set(F[t].subarray(y*(stride+1)+1, (y+1)*(stride+1)), y*(stride+1)+1); }
-  return raw;
-}
+function signedSum(row: Uint8Array): number { let s = 0; for (let i = 0; i < row.length; i++) { const v = row[i]; s += v < 128 ? v : 256 - v; } return s; }
 
-// ---------- Huffman: heap lengths, clamp to maxBits, Kraft repair, canonical codes ----------
-// Returns {lens: Uint8Array, codes: Uint32Array, kraftOk: boolean}
-function huffLengths(freq, maxBits) {
+// ---------- DEFLATE tables ----------
+const LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+const LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+const DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+const DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+const LEN_SYM = new Int32Array(259); const LEN_EB = new Int32Array(259); const LEN_B = new Int32Array(259);
+for (let s = 0; s < 29; s++) { const lo = LEN_BASE[s]; const hi = s === 28 ? 258 : LEN_BASE[s + 1] - 1; for (let l = lo; l <= hi; l++) { LEN_SYM[l] = 257 + s; LEN_EB[l] = LEN_EXTRA[s]; LEN_B[l] = lo; } }
+const DIST_SYM = new Int32Array(32769); const DIST_EB = new Int32Array(32769); const DIST_B = new Int32Array(32769);
+for (let s = 0; s < 30; s++) { const lo = DIST_BASE[s]; const hi = s === 29 ? 32768 : DIST_BASE[s + 1] - 1; for (let d = lo; d <= hi; d++) { DIST_SYM[d] = s; DIST_EB[d] = DIST_EXTRA[s]; DIST_B[d] = lo; } }
+// length-code range starts (for sublen expansion)
+const LEN_RANGE_START = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227];
+// bit-reverse table for 15 bits
+const REV15 = new Uint16Array(32768);
+for (let i = 0; i < 32768; i++) { let r = 0, x = i; for (let k = 0; k < 15; k++) { r = (r << 1) | (x & 1); x >>= 1; } REV15[i] = r; }
+
+// ---------- Huffman lengths: heap Huffman + length limit with exact Kraft fix ----------
+function buildLengths(freq: Int32Array, maxLen: number): Int32Array | null {
   const n = freq.length;
-  const lens = new Uint8Array(n);
-  const syms = [];
-  for (let i = 0; i < n; i++) if (freq[i] > 0) syms.push(i);
-  if (syms.length === 0) return { lens, codes: new Uint32Array(n), kraftOk: true };
-  if (syms.length === 1) {
-    lens[syms[0]] = 1;
-    // a single code of length 1 is incomplete: add a dummy code of length 1 (never emitted)
-    for (let i = 0; i < n; i++) if (i !== syms[0]) { lens[i] = 1; break; }
+  let used = 0; let onlySym = -1;
+  for (let i = 0; i < n; i++) if (freq[i] > 0) { used++; onlySym = i; }
+  if (used === 0) return new Int32Array(n);
+  if (used === 1) { const l = new Int32Array(n); l[onlySym] = 1; return l; }
+  // heap of nodes: [weight, sym(-1 internal), left, right] in arrays
+  const w: number[] = []; const sym: number[] = []; const left: number[] = []; const right: number[] = [];
+  const heap: number[] = [];
+  const push = (id: number) => { heap.push(id); let i = heap.length - 1; while (i > 0) { const p = (i - 1) >> 1; if (w[heap[p]] <= w[heap[i]]) break; const t = heap[p]; heap[p] = heap[i]; heap[i] = t; i = p; } };
+  const pop = (): number => { const top = heap[0]; const last = heap.pop()!; if (heap.length) { heap[0] = last; let i = 0; for (;;) { const l = i * 2 + 1, r = l + 1; let m = i; if (l < heap.length && w[heap[l]] < w[heap[m]]) m = l; if (r < heap.length && w[heap[r]] < w[heap[m]]) m = r; if (m === i) break; const t = heap[m]; heap[m] = heap[i]; heap[i] = t; i = m; } } return top; };
+  for (let i = 0; i < n; i++) if (freq[i] > 0) { const id = w.length; w.push(freq[i]); sym.push(i); left.push(-1); right.push(-1); push(id); }
+  while (heap.length > 1) {
+    const a = pop(); const b = pop();
+    const id = w.length; w.push(w[a] + w[b]); sym.push(-1); left.push(a); right.push(b); push(id);
   }
-  else {
-    // heap of [freq, tie, nodeIndex]; nodes: leaves are syms, internal nodes in arrays
-    const nf = [], nl = [], nr = []; // node freq, left, right (child node ids; leaf id = sym, internal id = n+k)
-    const heap = [];
-    const push = (id) => { heap.push(id); let i = heap.length - 1; while (i > 0) { const p = (i-1)>>1; if (nf[heap[p]] < nf[heap[i]] || (nf[heap[p]] === nf[heap[i]] && heap[p] < heap[i])) break; const t = heap[p]; heap[p] = heap[i]; heap[i] = t; i = p; } };
-    const pop = () => { const top = heap[0], last = heap.pop(); if (heap.length) { heap[0] = last; let i = 0; for (;;) { const l = i*2+1, r = l+1; let m = i; if (l < heap.length && (nf[heap[l]] < nf[heap[m]] || (nf[heap[l]] === nf[heap[m]] && heap[l] < heap[m]))) m = l; if (r < heap.length && (nf[heap[r]] < nf[heap[m]] || (nf[heap[r]] === nf[heap[m]] && heap[r] < heap[m]))) m = r; if (m === i) break; const t = heap[m]; heap[m] = heap[i]; heap[i] = t; i = m; } } return top; };
-    for (const s of syms) { nf[s] = freq[s]; nl[s] = -1; nr[s] = -1; push(s); }
-    let next = n;
-    while (heap.length > 1) {
-      const a = pop(), b = pop();
-      nf[next] = nf[a] + nf[b]; nl[next] = a; nr[next] = b; push(next); next++;
-    }
-    const root = heap[0];
-    const stack = [[root, 0]];
-    while (stack.length) { const [id, d] = stack.pop(); if (id < n) lens[id] = d; else { stack.push([nl[id], d+1]); stack.push([nr[id], d+1]); } }
-    // clamp + repair (zlib-style overflow handling via Kraft adjustment)
-    let over = 0;
-    for (const s of syms) if (lens[s] > maxBits) over += lens[s] - maxBits;
-    if (over > 0) {
-      for (const s of syms) if (lens[s] > maxBits) lens[s] = maxBits;
-      // Kraft sum in units of 2^-maxBits
-      const kraft = () => { let s = 0; for (const x of syms) s += 1 << (maxBits - lens[x]); return s; };
-      let k = kraft();
-      const full = 1 << maxBits;
-      // If sum > full, lengthen the longest (least frequent first) codes one step at a time.
-      while (k > full) {
-        let pick = -1, worst = -1;
-        for (const s of syms) if (lens[s] < maxBits && (lens[s] > worst || (lens[s] === worst && freq[s] < freq[pick]))) { worst = lens[s]; pick = s; }
-        if (pick < 0) break;
-        lens[pick]++; k -= 1 << (maxBits - lens[pick]);
-      }
-      // If sum < full, shorten the shortest (most frequent) codes.
-      // Shortening L -> L-1 increases Kraft by 2^(maxBits-L) (old contribution).
-      while (k < full) {
-        let pick = -1, best = 99;
-        for (const s of syms) if (lens[s] > 1 && (lens[s] < best || (lens[s] === best && freq[s] > freq[pick]))) { best = lens[s]; pick = s; }
-        if (pick < 0) break;
-        lens[pick]--; k += 1 << (maxBits - lens[pick] - 1);
-      }
-      // Exactness check: if the repair did not land exactly on a complete code,
-      // fall back to a provably complete assignment (shorter codes to frequent symbols).
-      {
-        let kk = 0; for (const s of syms) kk += 1 << (maxBits - lens[s]);
-        if (kk !== full) {
-          const cnt = syms.length;
-          const d = Math.floor(Math.log2(cnt));
-          const nShort = (1 << (d + 1)) - cnt; // symbols at length d
-          const byFreq = syms.slice().sort((a, b) => freq[b] - freq[a] || a - b);
-          for (let i = 0; i < byFreq.length; i++) lens[byFreq[i]] = i < nShort ? d : d + 1;
-          // the dummy symbol (freq 0) keeps length 1 only if it was the single-symbol case;
-          // here cnt >= 2, so no dummy is present.
-        }
-      }
-    }
+  const root = heap[0];
+  const len = new Int32Array(n);
+  const stack: number[] = [root]; const dstack: number[] = [0];
+  while (stack.length) { const id = stack.pop()!; const d = dstack.pop()!; if (sym[id] >= 0) len[sym[id]] = d; else { stack.push(left[id]); dstack.push(d + 1); stack.push(right[id]); dstack.push(d + 1); } }
+  let mx = 0; for (let i = 0; i < n; i++) if (len[i] > mx) mx = len[i];
+  if (mx <= maxLen) {
+    // Kraft must be exactly 2^maxLen units for completeness (heap Huffman is complete)
+    return len;
   }
-  // canonical codes, MSB-first values
-  // Final safety net: a complete code is mandatory; if anything above left Kraft != full, use the complete fallback.
-  {
-    let kk = 0, cnt = 0;
-    for (const s of syms) { kk += 1 << (maxBits - lens[s]); cnt++; }
-    if (cnt >= 2 && kk !== (1 << maxBits)) {
-      const d = Math.floor(Math.log2(cnt));
-      const nShort = (1 << (d + 1)) - cnt;
-      const byFreq = syms.slice().sort((a, b) => freq[b] - freq[a] || a - b);
-      for (let i = 0; i < byFreq.length; i++) lens[byFreq[i]] = i < nShort ? d : d + 1;
+  // cap + fix: work in units of 2^-maxLen
+  const full = 1 << maxLen;
+  for (let i = 0; i < n; i++) if (len[i] > maxLen) len[i] = maxLen;
+  let sum = 0; for (let i = 0; i < n; i++) if (len[i] > 0) sum += 1 << (maxLen - len[i]);
+  let guard = 0;
+  while (sum > full && guard++ < 100000) {
+    const need = sum - full;
+    // lengthen the rarest symbol whose step fits, else the one with the smallest step
+    let best = -1, bestF = Infinity, bestStep = Infinity;
+    for (let i = 0; i < n; i++) if (len[i] > 0 && len[i] < maxLen) {
+      const step = 1 << (maxLen - len[i] - 1);
+      if (step <= need && freq[i] < bestF) { bestF = freq[i]; best = i; bestStep = step; }
     }
+    if (best < 0) {
+      for (let i = 0; i < n; i++) if (len[i] > 0 && len[i] < maxLen) { const step = 1 << (maxLen - len[i] - 1); if (step < bestStep) { bestStep = step; best = i; } }
+    }
+    if (best < 0) break;
+    sum -= bestStep; len[best]++;
   }
-  const codes = new Uint32Array(n);
-  const bl = new Uint32Array(maxBits + 1);
-  for (const s of syms) bl[lens[s]]++;
-  let code = 0; const nextCode = new Uint32Array(maxBits + 1);
-  for (let b = 1; b <= maxBits; b++) { code = (code + bl[b-1]) << 1; nextCode[b] = code; }
-  const order = syms.slice().sort((a, b) => lens[a] - lens[b] || a - b);
-  for (const s of order) { codes[s] = nextCode[lens[s]]++; }
-  // exact Kraft check
-  let k = 0; for (const s of syms) k += 1 << (maxBits - lens[s]);
-  const kraftOk = syms.length <= 1 ? true : k === (1 << maxBits);
-  return { lens, codes, kraftOk };
+  guard = 0;
+  while (sum < full && guard++ < 100000) {
+    const need = full - sum;
+    // shorten the most frequent symbol whose add fits exactly
+    let best = -1, bestF = -1, bestAdd = 0;
+    for (let i = 0; i < n; i++) if (len[i] > 1) {
+      const add = 1 << (maxLen - len[i]);
+      if (add <= need && freq[i] > bestF) { bestF = freq[i]; best = i; bestAdd = add; }
+    }
+    if (best < 0) break;
+    sum += bestAdd; len[best]--;
+  }
+  if (sum !== full) return null;
+  return len;
 }
-function kraftCheck(lens, maxBits) { let k = 0, cnt = 0; for (let i = 0; i < lens.length; i++) if (lens[i]) { cnt++; k += 1 << (maxBits - lens[i]); } return cnt <= 1 ? true : k === (1 << maxBits); }
+function kraftOk(len: Int32Array, maxLen: number): boolean {
+  let sum = 0; let used = 0;
+  for (let i = 0; i < len.length; i++) if (len[i] > 0) { used++; sum += 1 << (maxLen - len[i]); }
+  if (used === 1) return len.some ? true : true; // single symbol: length 1 accepted by inflate
+  return sum === (1 << maxLen);
+}
+function canonicalCodes(len: Int32Array): { code: Int32Array; } {
+  const maxL = Math.max(0, ...len);
+  const blCount = new Int32Array(maxL + 1);
+  for (let i = 0; i < len.length; i++) if (len[i] > 0) blCount[len[i]]++;
+  const code = new Int32Array(len.length);
+  let next = 0;
+  const nextCode = new Int32Array(maxL + 1);
+  for (let b = 1; b <= maxL; b++) { next = (next + blCount[b - 1]) << 1; nextCode[b] = next; }
+  for (let i = 0; i < len.length; i++) if (len[i] > 0) code[i] = nextCode[len[i]]++;
+  return { code };
+}
 
-// ---------- bit writer (one shared writer across all blocks) ----------
+// ---------- Bit writer (single shared writer across blocks) ----------
 class BitWriter {
-  constructor() { this.bytes = []; this.acc = 0; this.nbits = 0; }
-  putBits(val, len) { // LSB-first stream bits (header fields, extra bits)
-    for (let i = 0; i < len; i++) { this.acc |= ((val >> i) & 1) << this.nbits; this.nbits++; if (this.nbits === 8) { this.bytes.push(this.acc); this.acc = 0; this.nbits = 0; } }
+  buf: number[] = []; bitbuf = 0; bitcnt = 0;
+  write(v: number, n: number): void {
+    this.bitbuf |= (v & ((1 << n) - 1)) << this.bitcnt; this.bitcnt += n;
+    while (this.bitcnt >= 8) { this.buf.push(this.bitbuf & 255); this.bitbuf >>>= 8; this.bitcnt -= 8; }
   }
-  putCode(code, len) { // Huffman code, MSB-first
-    for (let i = len - 1; i >= 0; i--) { this.acc |= ((code >> i) & 1) << this.nbits; this.nbits++; if (this.nbits === 8) { this.bytes.push(this.acc); this.acc = 0; this.nbits = 0; } }
+  // write a Huffman code (value `code` of `n` bits, MSB first into the stream)
+  writeCode(code: number, n: number): void {
+    const rev = REV15[code] >> (15 - n); // bit-reverse the n-bit code so MSB goes first
+    this.write(rev, n);
   }
-  finish() { if (this.nbits) this.bytes.push(this.acc); return new Uint8Array(this.bytes); }
+  finish(): Uint8Array {
+    if (this.bitcnt > 0) { this.buf.push(this.bitbuf & 255); this.bitbuf = 0; this.bitcnt = 0; }
+    return Uint8Array.from(this.buf);
+  }
 }
 
-// ---------- cost tables from Huffman lengths ----------
-function makeCostTables(litLens, distLens) {
-  const litCost = new Float64Array(288), distCost = new Float64Array(30);
-  for (let i = 0; i < 256; i++) litCost[i] = litLens[i] || 12;
-  for (let s = 0; s < 29; s++) litCost[257+s] = (litLens[257+s] || 12) + LEN_EXTRA[s];
-  litCost[256] = litLens[256] || 7;
-  for (let s = 0; s < 30; s++) distCost[s] = (distLens[s] || 12) + DIST_EXTRA[s];
-  return { litCost, distCost };
+// ---------- Match finder: 3-byte hash tree (binary search tree per hash bucket) ----------
+// Every position is inserted into the 3-byte-prefix tree (primary index). Run-keyed
+// records are a supplementary fast path only; the tree walk is what the parse trusts.
+interface Finder { candLen: Uint16Array; candDist: Uint16Array; candCnt: Uint8Array; bestLen: Uint16Array; visits: number; positions: number; }
+const KCAND = 4;
+function matchLen(d: Uint8Array, a: number, b: number, limit: number): number {
+  const max = Math.min(limit, d.length - b);
+  let i = 0;
+  while (i < max && d[a + i] === d[b + i]) i++;
+  return i;
 }
-function fixedCostTables() { return makeCostTables(FIXED_LIT, FIXED_DIST); }
-function matchBitCost(len, dist, litCost, distCost) {
-  return litCost[lenSym(len)] + distCost[distSym(dist)];
+// Match length, but only pay the full compare when the match can beat `best`:
+// if it cannot, the returned length is exact and <= best.
+function matchLenBest(d: Uint8Array, a: number, b: number, limit: number, best: number): number {
+  const max = Math.min(limit, d.length - b);
+  const cap = Math.min(max, best + 1);
+  let i = 0;
+  while (i < cap && d[a + i] === d[b + i]) i++;
+  if (i < cap || cap >= max) return i;
+  while (i < max && d[a + i] === d[b + i]) i++;
+  return i;
 }
-
-// ---------- match finder (hash chain + row-above probes, every position) ----------
-function findMatches(buf, hist, L, rowLen, maxLen, depth, out) {
-  const n = hist + L;
-  const head = new Int32Array(262144).fill(-1);
-  const prev = new Int32Array(n).fill(-1);
-  const { bestLen, bestDist, secLen, secDist } = out;
-  // run lengths (capped at maxLen) for O(1) match-extension jumps inside runs
+function buildFinder(data: Uint8Array, rowStride: number, maxDepth: number, period: number): Finder {
+  const n = data.length;
   const runLen = new Uint16Array(n + 1);
-  runLen[n-1] = 1;
-  for (let i = n - 2; i >= 0; i--) runLen[i] = buf[i] === buf[i+1] ? Math.min(maxLen, runLen[i+1] + 1) : 1;
+  for (let i = n - 1; i >= 0; i--) runLen[i] = data[i] === data[i + 1] ? Math.min(runLen[i + 1] + 1, 520) : 1;
+  // pixel-period run: q[i] = length of the run repeating with the pixel period
+  // (data[i+k] == data[i+k-period] for k = 0..q[i]-1), capped at 520
+  const perRun = new Uint16Array(n + 1);
+  if (period > 1) {
+    for (let i = n - 1; i >= 0; i--) perRun[i] = i >= period && data[i] === data[i - period] ? Math.min(perRun[i + 1] + 1, 520) : 0;
+  }
+  const candLen = new Uint16Array(n * KCAND); const candDist = new Uint16Array(n * KCAND);
+  const candCnt = new Uint8Array(n); const bestLen = new Uint16Array(n);
+  // BST per 3-byte hash: root[65536], left/right child slots per position (pre-allocated).
+  const root = new Int32Array(65536).fill(-1);
+  const left = new Int32Array(n).fill(-1); const right = new Int32Array(n).fill(-1);
+  // Recency chain per 3-byte hash (head/prev): the BST alone degenerates on periodic
+  // data (equal suffixes form a position-ordered chain whose nodes fall out of the
+  // 32K window), so the chain guarantees the nearest occurrences stay reachable.
+  const head = new Int32Array(65536).fill(-1);
+  const prev = new Int32Array(n).fill(-1);
+  const bstDepth = Math.max(8, maxDepth >> 1);
   let visits = 0;
-  // per-length best distance (Pareto): nearest distance achieving >=3, >=8, >=24
-  const nearLen = out.nearLen, nearDist = out.nearDist;
-  // match extension, inlined at both call sites (no function call per candidate):
-  // jump over identical-byte runs, then compare byte by byte up to `bound`.
-  // `bound` is lim normally, or bestL when the byte at bestL already differs
-  // (then the true match cannot exceed bestL).
-  for (let p = 0; p < n; p++) {
-    if (p + 2 < n) {
-      const h = (((buf[p] * 257 + buf[p+1]) * 257 + buf[p+2]) * 2654435761) >>> 14 & 262143;
-      if (p >= hist) {
-        let bestL = 0, bestD = 0, secL = 0, secD = 0;
-        const lim = Math.min(maxLen, n - p);
-        const base3 = p * 3;
-        let v = 0;
-        let cand = head[h];
-        while (cand >= 0 && v < depth) {
-          const dist = p - cand;
-          if (dist > 32768) break;
-          v++;
-          if (buf[cand] === buf[p] && buf[cand+1] === buf[p+1] && buf[cand+2] === buf[p+2]) {
-            let len = -1;
-            if (bestL >= 3 && secL >= bestL && buf[cand+bestL] !== buf[p+bestL]) {
-              len = -1; // cannot improve best/second; near already set by nearer candidates
-            } else {
-              const bound = (bestL >= 3 && buf[cand+bestL] !== buf[p+bestL]) ? bestL : lim;
-              len = runLen[cand] < runLen[p] ? runLen[cand] : runLen[p];
-              if (len < bound) { while (len < bound && buf[cand+len] === buf[p+len]) len++; }
-              if (len > bound) len = bound;
-            }
-            if (len >= 3) {
-              if (len > bestL || (len === bestL && dist < bestD)) { if (bestL > secL && bestD !== dist) { secL = bestL; secD = bestD; } bestL = len; bestD = dist; }
-              else if (len > secL) { secL = len; secD = dist; }
-              if (len >= 3 && dist < nearDist[base3]) { nearDist[base3] = dist; nearLen[base3] = len; }
-              if (len >= 8 && dist < nearDist[base3+1]) { nearDist[base3+1] = dist; nearLen[base3+1] = len; }
-              if (len >= 24 && dist < nearDist[base3+2]) { nearDist[base3+2] = dist; nearLen[base3+2] = len; }
-            }
-            if (bestL >= 64) break;
-            if (bestL >= lim) break;
-          }
-          cand = prev[cand];
-        }
-        visits += v;
-        // row-above probes (one and two scanlines above)
-        for (let k = 1; k <= 2; k++) {
-          const c2 = p - k * rowLen;
-          if (c2 < 0) break;
-          const dist = k * rowLen;
-          if (dist > 32768) break;
-          if (buf[c2] === buf[p] && buf[c2+1] === buf[p+1] && buf[c2+2] === buf[p+2]) {
-            const bound = (bestL >= 3 && buf[c2+bestL] !== buf[p+bestL]) ? bestL : lim;
-            let len = runLen[c2] < runLen[p] ? runLen[c2] : runLen[p];
-            if (len < bound) { while (len < bound && buf[c2+len] === buf[p+len]) len++; }
-            if (len > bound) len = bound;
-            if (len >= 3) {
-              if (len > bestL || (len === bestL && dist < bestD)) { if (bestL > secL && bestD !== dist) { secL = bestL; secD = bestD; } bestL = len; bestD = dist; }
-              else if (len > secL) { secL = len; secD = dist; }
-              if (len >= 3 && dist < nearDist[base3]) { nearDist[base3] = dist; nearLen[base3] = len; }
-              if (len >= 8 && dist < nearDist[base3+1]) { nearDist[base3+1] = dist; nearLen[base3+1] = len; }
-              if (len >= 24 && dist < nearDist[base3+2]) { nearDist[base3+2] = dist; nearLen[base3+2] = len; }
-            }
-          }
-        }
-        bestLen[p] = bestL; bestDist[p] = bestD; secLen[p] = secL; secDist[p] = secD;
+  const tmpLen = new Int32Array(8); const tmpDist = new Int32Array(8);
+  for (let i = 0; i < n; i++) {
+    const rl = runLen[i];
+    let tc = 0;
+    // add() keeps tmpLen/tmpDist sorted by length desc (distance asc within a
+    // length), so the Pareto scan below is linear and no sort pass is needed.
+    const add = (len: number, dist: number) => {
+      if (len < 3 || dist <= 0 || dist > 32768 || dist > i) return;
+      let p = 0;
+      while (p < tc && tmpLen[p] > len) p++;
+      if (p < tc && tmpLen[p] === len) { if (tmpDist[p] > dist) tmpDist[p] = dist; return; }
+      if (tc < 8) {
+        for (let k = tc; k > p; k--) { tmpLen[k] = tmpLen[k - 1]; tmpDist[k] = tmpDist[k - 1]; }
+        tmpLen[p] = len; tmpDist[p] = dist; tc++;
+      } else if (p < 8) {
+        for (let k = 7; k > p; k--) { tmpLen[k] = tmpLen[k - 1]; tmpDist[k] = tmpDist[k - 1]; }
+        tmpLen[p] = len; tmpDist[p] = dist;
       }
-      prev[p] = head[h]; head[h] = p;
+    };
+    // run-length fast path: must return the FULL run length (up to 258) before any early break.
+    // A distance-1 match copies the byte BEFORE the match first, so it is only
+    // valid when data[i] == data[i-1] (inside a run, not at its start); at a run
+    // start the run's bytes cannot be produced from the previous (different) byte.
+    const runOk = i > 0 && data[i] === data[i - 1];
+    const rlV = runOk ? rl : 0;
+    if (rl >= 3 && runOk) add(Math.min(rl, 258), 1);
+    let bestSoFar = rl >= 3 && runOk ? Math.min(rl, 258) : 0;
+    // pixel-period fast path: a repeated pixel gives a match at distance = period
+    const pr = period > 1 ? perRun[i] : 0;
+    if (pr >= 3) { add(Math.min(pr, 258), period); if (Math.min(pr, 258) > bestSoFar) bestSoFar = Math.min(pr, 258); }
+    // row-above probe (one scanline above; the two-scanline probe cost more
+    // CPU than the bytes it ever won)
+    if (rowStride > 0) {
+      for (let k = 1; k <= 1; k++) { const p = i - k * rowStride; if (p >= 0) { const ml = matchLenBest(data, p, i, 258, bestSoFar); if (ml >= 3) { add(ml, k * rowStride); if (ml > bestSoFar) bestSoFar = ml; } } }
     }
-  }
-  return visits;
-}
-
-// ---------- forward-DP optimal parse of one block ----------
-function dpParse(buf, hist, L, litCost, distCost, maxLen, finder) {
-  const dp = new Float64Array(L + 1); dp.fill(Infinity); dp[0] = 0;
-  const chLen = new Uint16Array(L + 1), chDist = new Uint16Array(L + 1);
-  const { bestLen, bestDist, secLen, secDist, nearLen, nearDist } = finder;
-  // per-length literal cost and per-distance cost for this iteration (no table lookups in the loop)
-  const lenCost = new Float64Array(259);
-  for (let l = 3; l <= 258; l++) lenCost[l] = litCost[LEN_SYM_TAB[l]];
-  const distCostByDist = new Float64Array(32769);
-  for (let d = 1; d <= 32768; d++) distCostByDist[d] = distCost[DIST_SYM_TAB[d]];
-  // candidate evaluation is inlined below (a closure call per candidate costs
-  // ~40% of DP time at ~450M candidate evaluations per full run)
-  for (let i = 0; i < L; i++) {
-    const base = dp[i]; if (!Number.isFinite(base)) continue;
-    const p = hist + i;
-    const nc = base + litCost[buf[p]];
-    if (nc < dp[i+1]) { dp[i+1] = nc; chLen[i+1] = 1; chDist[i+1] = 0; }
-    const bl = bestLen[p];
-    if (bl >= 3) {
-      const rem = L - i, ml = bl > rem ? rem : bl;
-      if (ml >= 3) {
-        const bd = bestDist[p];
-        { const len = ml, dist = bd; const j = i + len, c = base + lenCost[len] + distCostByDist[dist]; if (c < dp[j]) { dp[j] = c; chLen[j] = len; chDist[j] = dist; } }
-        if (secLen[p] >= 3) { const len = secLen[p] > rem ? rem : secLen[p], dist = secDist[p]; const j = i + len, c = base + lenCost[len] + distCostByDist[dist]; if (c < dp[j]) { dp[j] = c; chLen[j] = len; chDist[j] = dist; } }
-        if (ml > 3) {
-          { const len = 3, dist = bd; const j = i + len, c = base + lenCost[len] + distCostByDist[dist]; if (c < dp[j]) { dp[j] = c; chLen[j] = len; chDist[j] = dist; } }
-          { const len = ml - 1, dist = bd; const j = i + len, c = base + lenCost[len] + distCostByDist[dist]; if (c < dp[j]) { dp[j] = c; chLen[j] = len; chDist[j] = dist; } }
+    // hash + walks, unless a long run (byte run or pixel-period run) already dominates.
+    // (A 258 match from the row above must NOT skip the walks: a nearer shorter
+    // match can still be cheaper for the DP, so only byte/period runs skip.)
+    let insNode = -1, insCmp = 1;
+    const h = i + 3 <= n ? ((((data[i] << 16) ^ (data[i + 1] << 8) ^ data[i + 2]) * 2654435761) >>> 16 & 65535) : -1;
+    if (rlV < 16 && pr < 16 && i + 3 <= n) {
+      // recency chain walk (nearest occurrences first; break on out-of-window: prev is older)
+      {
+        let node = head[h]; let depth = 0; let best = 0;
+        while (node >= 0 && depth < maxDepth) {
+          visits++; depth++;
+          const d = i - node;
+          if (d > 32768) break;
+          const ml = matchLenBest(data, node, i, 258, Math.max(best, bestSoFar));
+          if (ml >= 3) { add(ml, d); if (ml > bestSoFar) bestSoFar = ml; }
+          if (ml > best) best = ml;
+          if (best >= 258) break; // nearest 258 cannot be beaten
+          node = prev[node];
         }
-        // sublen endpoints of the best match's length-code ranges (LEN_BASE
-        // ascends, so break once it reaches ml)
-        for (let s = 0; s < 29; s++) { const len = LEN_BASE[s]; if (len >= ml) break; if (len < 3) continue; const dist = bd; const j = i + len, c = base + lenCost[len] + distCostByDist[dist]; if (c < dp[j]) { dp[j] = c; chLen[j] = len; chDist[j] = dist; } }
-        // Pareto near-distance candidates: nearest match of >=3, >=8, >=24 bytes
-        const base3 = p * 3;
-        for (let k = 0; k < 3; k++) {
-          const nl = nearLen[base3 + k], nd = nearDist[base3 + k];
-          if (nl >= 3 && nd !== bd) {
-            { const len = nl > rem ? rem : nl, dist = nd; const j = i + len, c = base + lenCost[len] + distCostByDist[dist]; if (c < dp[j]) { dp[j] = c; chLen[j] = len; chDist[j] = dist; } }
-            if (nl > 3) { const len = 3, dist = nd; const j = i + len, c = base + lenCost[len] + distCostByDist[dist]; if (c < dp[j]) { dp[j] = c; chLen[j] = len; chDist[j] = dist; } }
+      }
+      // tree walk (diverse suffixes); out-of-window nodes are skipped, not a break:
+      // their children were inserted later and are nearer.
+      {
+        let node = root[h]; let depth = 0; let best = 0;
+        while (node >= 0 && depth < bstDepth) {
+          visits++; depth++;
+          const d = i - node;
+          let ml = -1;
+          if (d <= 32768) {
+            ml = matchLenBest(data, node, i, 258, Math.max(best, bestSoFar));
+            if (ml >= 3) { add(ml, d); if (ml > bestSoFar) bestSoFar = ml; }
+            if (ml > best) best = ml;
+            if (best >= 258) { insNode = node; insCmp = 1; break; }
           }
+          // walk direction from the first differing byte (ml is its offset when known)
+          const lim = Math.min(258, n - i, n - node);
+          let cmp: number;
+          if (ml >= 0) { if (ml >= lim) cmp = 1; else cmp = data[i + ml] < data[node + ml] ? -1 : 1; }
+          else { let j = 0; while (j < lim && data[node + j] === data[i + j]) j++; if (j >= lim) cmp = 1; else cmp = data[i + j] < data[node + j] ? -1 : 1; }
+          insNode = node; insCmp = cmp;
+          node = cmp < 0 ? left[node] : right[node];
+        }
+      }
+    }
+    // keep Pareto candidates: tmp is already sorted by length desc (add() maintains
+    // it), so this is a single linear scan keeping a new minimum distance each time
+    let kept = 0; let minDist = 1 << 30;
+    for (let k = 0; k < tc && kept < KCAND; k++) {
+      if (tmpDist[k] >= minDist && k > 0) continue; // dominated: shorter and not nearer
+      candLen[i * KCAND + kept] = tmpLen[k]; candDist[i * KCAND + kept] = tmpDist[k]; kept++;
+      if (tmpDist[k] < minDist) minDist = tmpDist[k];
+    }
+    candCnt[i] = kept;
+    bestLen[i] = kept > 0 ? candLen[i * KCAND] : 0;
+    // insert into both indexes (chain: every position, O(1); tree: search-path insert,
+    // skipping positions inside long runs — their suffix is the run's suffix).
+    if (i + 3 <= n) {
+      prev[i] = head[h]; head[h] = i;
+      if (rlV < 8) {
+        if (root[h] < 0) { root[h] = i; }
+        else if (insNode >= 0) {
+          if (insCmp < 0) { if (left[insNode] < 0) left[insNode] = i; }
+          else { if (right[insNode] < 0) right[insNode] = i; }
         }
       }
     }
   }
-  // backtrack
-  const litFreq = new Uint32Array(288), distFreq = new Uint32Array(30);
-  const toks = [];
-  let i = L, matchBytes = 0, nTok = 0;
-  while (i > 0) {
-    const len = chLen[i], dist = chDist[i];
-    if (len === 1 && dist === 0) { const b = buf[hist + i - 1]; litFreq[b]++; toks.push([0, b, 0]); }
-    else { const ls = lenSym(len), ds = distSym(dist); litFreq[ls]++; distFreq[ds]++; matchBytes += len; toks.push([1, len, dist]); }
-    nTok++; i -= len;
-  }
-  toks.reverse();
-  litFreq[256] = 1;
-  return { toks, bits: dp[L], litFreq, distFreq, matchBytes, nTok };
-}
-function headerBitsEst(litLens, distLens) {
-  // rough dynamic-header estimate: CL code lengths for RLE of lit+dist lengths
-  let nz = 0; for (let i = 0; i < 288; i++) if (litLens[i]) nz++; for (let i = 0; i < 30; i++) if (distLens[i]) nz++;
-  return 14 + 57 + nz * 4;
-}
-function parseBlockFull(buf, hist, L, rowLen, maxLen, depth, iters, isFlat) {
-  const finder = { bestLen: new Uint16Array(hist + L), bestDist: new Uint16Array(hist + L), secLen: new Uint16Array(hist + L), secDist: new Uint16Array(hist + L), nearLen: new Uint16Array((hist + L) * 3), nearDist: new Uint16Array((hist + L) * 3).fill(65535) };
-  const visits = findMatches(buf, hist, L, rowLen, maxLen, depth, finder);
-  let costs = fixedCostTables();
-  let best = null;
-  for (let it = 0; it < iters; it++) {
-    const r = dpParse(buf, hist, L, costs.litCost, costs.distCost, maxLen, finder);
-    const { lens: ll, codes: lc } = huffLengths(r.litFreq, 15);
-    const { lens: dl, codes: dc } = huffLengths(r.distFreq, 15);
-    // score by ACTUAL emitted token bits under this parse's own lengths, not stale dp bits
-    const tot = tokenBits(r.toks, ll, dl) + dynamicHeaderBits(ll, dl);
-    if (!best || tot < best.tot) best = { ...r, litLens: ll, distLens: dl, tot, visits };
-    costs = makeCostTables(ll, dl);
-  }
-  return best;
+  return { candLen, candDist, candCnt, bestLen, visits, positions: n };
 }
 
-// ---------- canonical codes from lengths ----------
-function codesFromLens(lens, maxBits) {
-  const codes = new Uint32Array(lens.length);
-  const bl = new Uint32Array(maxBits + 1);
-  for (let i = 0; i < lens.length; i++) if (lens[i]) bl[lens[i]]++;
-  let code = 0; const next = new Uint32Array(maxBits + 1);
-  for (let b = 1; b <= maxBits; b++) { code = (code + bl[b-1]) << 1; next[b] = code; }
-  const order = []; for (let i = 0; i < lens.length; i++) if (lens[i]) order.push(i);
-  order.sort((a, b) => lens[a] - lens[b] || a - b);
-  for (const s of order) codes[s] = next[lens[s]]++;
-  return codes;
-}
-function tokenBits(toks, litLens, distLens) {
-  let bits = 0;
-  for (const [m, a, b] of toks) {
-    if (!m) bits += litLens[a] || 12;
-    else bits += (litLens[LEN_SYM_TAB[a]] || 12) + LEN_EXTRA[LEN_SYM_TAB[a]-257] + (distLens[DIST_SYM_TAB[b]] || 12) + DIST_EXTRA[DIST_SYM_TAB[b]];
+// ---------- Optimal parse (shortest path DP, cost-table refinement) ----------
+const FIX_LIT_LEN = new Int32Array(286); const FIX_DIST_LEN = new Int32Array(30);
+for (let i = 0; i < 286; i++) FIX_LIT_LEN[i] = i < 144 ? 8 : i < 256 ? 9 : i < 280 ? 7 : 8;
+for (let i = 0; i < 30; i++) FIX_DIST_LEN[i] = 5;
+const FIX_LIT_CODE = new Int32Array(286);
+for (let i = 0; i < 286; i++) FIX_LIT_CODE[i] = i < 144 ? 0x30 + i : i < 256 ? 0x190 + i - 144 : i < 280 ? i - 256 : 0xc0 + i - 280;
+
+interface BlockResult { tokSym: Int32Array; tokDist: Int32Array; tokLen: Int32Array; ntok: number; dynBits: number; fixBits: number; litLen: Int32Array; distLen: Int32Array; useDyn: boolean; }
+function parseBlock(data: Uint8Array, finder: Finder, bs: number, be: number, iters: number, maxCand: number): BlockResult {
+  const m = be - bs;
+  const dp = new Float64Array(m + 1);
+  const choiceLen = new Int32Array(m + 1); const choiceDist = new Int32Array(m + 1);
+  const litC = new Float64Array(286); const distC = new Float64Array(30);
+  for (let i = 0; i < 286; i++) litC[i] = FIX_LIT_LEN[i];
+  for (let i = 0; i < 30; i++) distC[i] = 5;
+  const lenCost = new Float64Array(259); const distCost = new Float64Array(32769);
+  // token buffers (reused across iterations; best is copied out)
+  const tSym = new Int32Array(m + 1); const tDist = new Int32Array(m + 1); const tLen = new Int32Array(m + 1);
+  let best: BlockResult | null = null;
+  let lcg = 0x12345678;
+  const nextRand = () => { lcg = (lcg * 1103515245 + 12345) & 0x7fffffff; return lcg / 0x7fffffff; };
+  for (let iter = 0; iter < iters; iter++) {
+    for (let l = 3; l <= 258; l++) lenCost[l] = litC[LEN_SYM[l]] + LEN_EB[l];
+    for (let d = 1; d <= 32768; d++) distCost[d] = distC[DIST_SYM[d]] + DIST_EB[d];
+    dp[m] = 0; choiceLen[m] = 0; choiceDist[m] = 0;
+    for (let i = m - 1; i >= 0; i--) {
+      const pos = bs + i;
+      let bestCost = dp[i + 1] + litC[data[pos]];
+      let bl = 0, bd = 0;
+      const cnt = finder.candCnt[pos] < maxCand ? finder.candCnt[pos] : maxCand;
+      const base = pos * KCAND;
+      for (let c = 0; c < cnt; c++) {
+        const L = finder.candLen[base + c]; const D = finder.candDist[base + c];
+        if (D > pos || D > 32768) continue;
+        const dc = distCost[D];
+        // try L, then the range start of L's length code (landing on a cheap
+        // length code is the sublen value; the length-3 trial is dropped: the
+        // DP already searches matches at every interior position)
+        const rs = LEN_RANGE_START[LEN_SYM[L] - 257];
+        const l0 = L; const l1 = rs;
+        if (l0 >= 3 && i + l0 <= m) { const cost = dp[i + l0] + lenCost[l0] + dc; if (cost < bestCost) { bestCost = cost; bl = l0; bd = D; } }
+        if (l1 !== l0 && l1 >= 3 && i + l1 <= m) { const cost = dp[i + l1] + lenCost[l1] + dc; if (cost < bestCost) { bestCost = cost; bl = l1; bd = D; } }
+      }
+      dp[i] = bestCost; choiceLen[i] = bl; choiceDist[i] = bd;
+    }
+    // extract tokens + frequencies
+    const litFreq = new Int32Array(286); const distFreq = new Int32Array(30);
+    let ntok = 0; let i = 0;
+    while (i < m) {
+      const pos = bs + i;
+      if (choiceLen[i] === 0) { tSym[ntok] = data[pos]; tDist[ntok] = 0; tLen[ntok] = 0; litFreq[data[pos]]++; ntok++; i++; }
+      else { const L = choiceLen[i]; const D = choiceDist[i]; const s = LEN_SYM[L]; tSym[ntok] = s; tDist[ntok] = D; tLen[ntok] = L; litFreq[s]++; distFreq[DIST_SYM[D]]++; ntok++; i += L; }
+    }
+    litFreq[256]++; // end-of-block
+    const litLen = buildLengths(litFreq, 15); const distLen = buildLengths(distFreq, 7);
+    const litLenU = litLen ?? FIX_LIT_LEN; const distLenU = distLen ?? FIX_DIST_LEN;
+    // exact token bits under dynamic and fixed trees
+    let dynBits = 0, fixBits = 0;
+    for (let k = 0; k < ntok; k++) {
+      if (tLen[k] === 0) { dynBits += litLenU[tSym[k]]; fixBits += FIX_LIT_LEN[tSym[k]]; }
+      else { const s = tSym[k]; dynBits += litLenU[s] + LEN_EB[tLen[k]] + distLenU[DIST_SYM[tDist[k]]] + DIST_EB[tDist[k]]; fixBits += FIX_LIT_LEN[s] + LEN_EB[tLen[k]] + 5 + DIST_EB[tDist[k]]; }
+    }
+    dynBits += litLenU[256]; fixBits += 7;
+    const hb = headerBits(litLenU, distLenU);
+    const totalDyn = (litLen && distLen && hb !== Infinity) ? dynBits + hb : Infinity;
+    const total = Math.min(totalDyn, fixBits);
+    if (!best || total < Math.min(best.dynBits, best.fixBits)) {
+      best = {
+        tokSym: tSym.slice(0, ntok), tokDist: tDist.slice(0, ntok), tokLen: tLen.slice(0, ntok), ntok,
+        dynBits: totalDyn, fixBits, litLen: litLenU.slice(), distLen: distLenU.slice(),
+        useDyn: totalDyn <= fixBits,
+      };
+    }
+    if (iter === iters - 1) break;
+    // re-derive costs; damped on every 3rd iteration; one deterministic perturbation late
+    const damped = iter % 3 === 2;
+    for (let s = 0; s < 286; s++) {
+      const target = litLenU[s] > 0 ? litLenU[s] : (s < 256 ? 9 : 15);
+      litC[s] = damped ? (litC[s] + target) / 2 : target;
+    }
+    for (let s = 0; s < 30; s++) {
+      const target = distLenU[s] > 0 ? distLenU[s] : 15;
+      distC[s] = damped ? (distC[s] + target) / 2 : target;
+    }
+    if ((iter === iters - 2 || iter === 5) && iters >= 6) {
+      const mag = iter === iters - 2 ? 0.05 : 0.10;
+      for (let s = 0; s < 286; s++) if (litFreq[s] > 0) litC[s] *= 1 + (nextRand() - 0.5) * 2 * mag;
+      for (let s = 0; s < 30; s++) if (distFreq[s] > 0) distC[s] *= 1 + (nextRand() - 0.5) * 2 * mag;
+    }
   }
-  bits += litLens[256] || 7;
-  return bits;
+  return best!;
 }
-function rleLengthsReal(arr) {
-  const syms = []; const clFreq = new Uint32Array(19);
+
+// ---------- Dynamic header: RLE + code-length code ----------
+const CL_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+function rleOf(litLen: Int32Array, distLen: Int32Array, litCount: number, distCount: number): { sym: Int32Array; extra: Int32Array; ebits: Int32Array; clFreq: Int32Array; } {
+  const arr = new Int32Array(litCount + distCount);
+  arr.set(litLen.subarray(0, litCount)); arr.set(distLen.subarray(0, distCount), litCount);
+  const sym: number[] = []; const extra: number[] = []; const ebits: number[] = []; const clFreq = new Int32Array(19);
+  const push = (s: number, e: number, b: number) => { sym.push(s); extra.push(e); ebits.push(b); clFreq[s]++; };
   let i = 0;
   while (i < arr.length) {
     const v = arr[i];
     if (v === 0) {
-      let run = 0; while (i + run < arr.length && arr[i+run] === 0) run++;
-      let left = run;
-      while (left >= 11) { const n = Math.min(left, 138); syms.push([18, n-11, 7]); clFreq[18]++; left -= n; }
-      if (left >= 3) { syms.push([17, left-3, 3]); clFreq[17]++; left = 0; }
-      while (left > 0) { syms.push([0, 0, 0]); clFreq[0]++; left--; }
-      i += run;
+      let j = i; while (j < arr.length && arr[j] === 0) j++;
+      let run = j - i;
+      while (run >= 11) { const t = Math.min(run, 138); push(18, t - 11, 7); run -= t; }
+      if (run >= 3) { push(17, run - 3, 3); run = 0; }
+      while (run > 0) { push(0, 0, 0); run--; }
+      i = j;
     } else {
-      syms.push([v, 0, 0]); clFreq[v]++; i++;
-      let rep = 0; while (i + rep < arr.length && arr[i+rep] === v) rep++;
-      let left = rep;
-      while (left >= 3) { const n = Math.min(left, 6); syms.push([16, n-3, 2]); clFreq[16]++; left -= n; }
-      for (let k = 0; k < left; k++) { syms.push([v, 0, 0]); clFreq[v]++; }
-      i += rep;
+      push(v, 0, 0);
+      let j = i + 1; while (j < arr.length && arr[j] === v) j++;
+      let run = j - i - 1;
+      while (run >= 3) { const t = Math.min(run, 6); push(16, t - 3, 2); run -= t; }
+      while (run > 0) { push(v, 0, 0); run--; }
+      i = j;
     }
   }
-  return { syms, clFreq };
+  return { sym: Int32Array.from(sym), extra: Int32Array.from(extra), ebits: Int32Array.from(ebits), clFreq };
 }
-function trimmedCounts(litLens, distLens) {
-  let litCount = 257; for (let i = 287; i >= 257; i--) if (litLens[i]) { litCount = i + 1; break; }
-  let distCount = 1; for (let i = 29; i >= 1; i--) if (distLens[i]) { distCount = i + 1; break; }
-  return [litCount, distCount];
+function trimCounts(litLen: Int32Array, distLen: Int32Array): { litCount: number; distCount: number; } {
+  let litCount = 286; while (litCount > 257 && litLen[litCount - 1] === 0) litCount--;
+  let distCount = 30; while (distCount > 1 && distLen[distCount - 1] === 0) distCount--;
+  return { litCount, distCount };
 }
-function dynamicHeaderBits(litLens, distLens) {
-  const [litCount, distCount] = trimmedCounts(litLens, distLens);
-  const arr = [];
-  for (let i = 0; i < litCount; i++) arr.push(litLens[i]);
-  for (let i = 0; i < distCount; i++) arr.push(distLens[i]);
-  const { syms, clFreq } = rleLengthsReal(arr);
-  const { lens: clLens } = huffLengths(clFreq, 7);
-  let hclen = 4; for (let k = 18; k >= 4; k--) if (clLens[CL_ORDER[k]]) { hclen = k + 1; break; }
-  let bits = 5 + 5 + 4 + hclen * 3;
-  for (const [s, , eb] of syms) bits += (clLens[s] || 0) + eb;
+function headerBits(litLen: Int32Array, distLen: Int32Array): number {
+  const { litCount, distCount } = trimCounts(litLen, distLen);
+  const r = rleOf(litLen, distLen, litCount, distCount);
+  const clLen = buildLengths(r.clFreq, 7);
+  if (!clLen) return Infinity;
+  let clCount = 19; while (clCount > 4 && clLen[CL_ORDER[clCount - 1]] === 0) clCount--;
+  let bits = 3 + 5 + 5 + 4 + 3 * clCount;
+  for (let k = 0; k < r.sym.length; k++) bits += clLen[r.sym[k]] + r.ebits[k];
   return bits;
 }
-function writeDynamicHeader(bw, litLens, distLens) {
-  let litCount = 257; for (let i = 287; i >= 257; i--) if (litLens[i]) { litCount = i + 1; break; }
-  let distCount = 1; for (let i = 29; i >= 1; i--) if (distLens[i]) { distCount = i + 1; break; }
-  const arr = [];
-  for (let i = 0; i < litCount; i++) arr.push(litLens[i]);
-  for (let i = 0; i < distCount; i++) arr.push(distLens[i]);
-  const { syms, clFreq } = rleLengthsReal(arr);
-  const { lens: clLens, codes: clCodes } = huffLengths(clFreq, 7);
-  let hclen = 4; for (let k = 18; k >= 4; k--) if (clLens[CL_ORDER[k]]) { hclen = k + 1; break; }
-  bw.putBits(litCount - 257, 5); bw.putBits(distCount - 1, 5); bw.putBits(hclen - 4, 4);
-  for (let k = 0; k < hclen; k++) bw.putBits(clLens[CL_ORDER[k]], 3);
-  for (const [s, extra, eb] of syms) { bw.putCode(clCodes[s], clLens[s]); if (eb) bw.putBits(extra, eb); }
-  return { clLens, litCount, distCount };
-}
-function emitBlock(bw, blk, isLast) {
-  let litLens = blk.litLens, distLens = blk.distLens, useFixed = blk.useFixed;
-  if (!useFixed) {
-    if (!kraftCheck(litLens, 15) || !kraftCheck(distLens, 15)) { useFixed = true; }
+function emitBlock(bw: BitWriter, blk: BlockResult, isLast: boolean, kraftFail: { n: number }): void {
+  // a dynamic block whose code-length code cannot be built must fall back to fixed
+  if (blk.useDyn) {
+    const tc = trimCounts(blk.litLen, blk.distLen);
+    const r0 = rleOf(blk.litLen, blk.distLen, tc.litCount, tc.distCount);
+    if (!buildLengths(r0.clFreq, 7)) blk = { ...blk, useDyn: false };
   }
-  let litCodes, distCodes;
-  if (useFixed) { litLens = FIXED_LIT; distLens = FIXED_DIST; }
-  litCodes = codesFromLens(litLens, 15); distCodes = codesFromLens(distLens, 15);
-  bw.putBits(isLast ? 1 : 0, 1);
-  if (useFixed) { bw.putBits(1, 2); }
-  else {
-    bw.putBits(2, 2);
-    const { clLens } = writeDynamicHeader(bw, litLens, distLens);
-    if (!kraftCheck(clLens, 7)) { /* header already written; cannot undo — but Kraft repair guarantees pass */ }
-  }
-  for (const [m, a, b] of blk.toks) {
-    if (!m) bw.putCode(litCodes[a], litLens[a]);
-    else {
-      const ls = LEN_SYM_TAB[a], ds = DIST_SYM_TAB[b];
-      bw.putCode(litCodes[ls], litLens[ls]);
-      if (LEN_EXTRA[ls-257]) bw.putBits(a - LEN_BASE[ls-257], LEN_EXTRA[ls-257]);
-      bw.putCode(distCodes[ds], distLens[ds]);
-      if (DIST_EXTRA[ds]) bw.putBits(b - DIST_BASE[ds], DIST_EXTRA[ds]);
-    }
-  }
-  bw.putCode(litCodes[256], litLens[256]);
-  return useFixed;
-}
-
-// ---------- compress one filtered stream with custom DEFLATE ----------
-function compressStream(raw, seq, w, h, bpp, isFlat, isDense) {
-  const rowLen = w * bpp + 1;
-  const H = raw.length;
-  // initial boundaries: filter changes only where the segment is worth a new tree (>=16KB),
-  // plus a 192KB cap, all aligned to row starts (run-aware: never split inside a run mid-row)
-  const bounds = [0];
-  for (let y = 1; y < h; y++) if (seq[y] !== seq[y-1] && y * rowLen - bounds[bounds.length-1] >= 65536) bounds.push(y * rowLen);
-  const capped = [0];
-  for (let k = 1; k < bounds.length; k++) {
-    let s = capped[capped.length-1];
-    while (bounds[k] - s > 256 * 1024) { const nb = s + Math.floor(256*1024 / rowLen) * rowLen; capped.push(nb); s = nb; }
-    capped.push(bounds[k]);
-  }
-  capped.push(H);
-  let blocks = [];
-  let kraftFail = 0;
-  const maxLen = 258; // the 128 cap for dense streams doubled token counts in flat blocks
-  // inside dense images while never helping photo blocks (their matches are short)
-  const depth = isFlat ? 96 : 48;
-  const iters = isFlat ? 5 : 3;
-  for (let k = 0; k + 1 < capped.length; k++) {
-    const s = capped[k], e = capped[k+1], L = e - s;
-    if (L <= 0) continue;
-    const hist = Math.min(32768, s);
-    const buf = raw.subarray(s - hist, e);
-    const best = parseBlockFull(buf, hist, L, rowLen, maxLen, depth, iters, isFlat);
-    if (process.env.MAKEFUN_DEBUG === '3') {
-      const libB = deflateSync(raw.subarray(s, e), { level: 9 }).length;
-      let litN = 0, litMax = 0, distN = 0, distMax = 0;
-      for (let i = 0; i < 288; i++) if (best.litLens[i]) { litN++; litMax = Math.max(litMax, best.litLens[i]); }
-      for (let i = 0; i < 30; i++) if (best.distLens[i]) { distN++; distMax = Math.max(distMax, best.distLens[i]); }
-      const eb = tokenBits(best.toks, best.litLens, best.distLens);
-      let badTok = null;
-      if (!Number.isFinite(eb)) { for (const tk of best.toks) { const [m, a, b] = tk; if (m && (a < 3 || a > 258 || b < 1 || b > 32768)) { badTok = tk; break; } } }
-      console.error(JSON.stringify({ block: k, L, matchFrac: +(best.matchBytes / Math.max(1, L)).toFixed(3), emitBits: eb, badTok, lib9: libB, toks: best.nTok, litN, litMax, distN, distMax }));
-    }
-    blocks.push({ s, e, toks: best.toks, litFreq: best.litFreq, distFreq: best.distFreq, litLens: best.litLens, distLens: best.distLens, visits: best.visits });
-  }
-  // split trials REMOVED (measured: re-parsing big blocks cost ~30% of parse CPU
-  // for <1% of bytes; initial filter-boundary splits + merge pass are enough)
-  // merge pass: adjacent blocks share one tree when no more expensive
-  const merged = [];
-  for (const blk of blocks) {
-    const last = merged[merged.length-1];
-    if (last) {
-      const lf = new Uint32Array(288), df = new Uint32Array(30);
-      for (let i = 0; i < 288; i++) lf[i] = last.litFreq[i] + blk.litFreq[i];
-      for (let i = 0; i < 30; i++) df[i] = last.distFreq[i] + blk.distFreq[i];
-      const { lens: ll } = huffLengths(lf, 15); const { lens: dl } = huffLengths(df, 15);
-      const allToks = last.toks.concat(blk.toks);
-      const mBits = tokenBits(allToks, ll, dl) + dynamicHeaderBits(ll, dl);
-      const sBits = tokenBits(last.toks, last.litLens, last.distLens) + dynamicHeaderBits(last.litLens, last.distLens)
-        + tokenBits(blk.toks, blk.litLens, blk.distLens) + dynamicHeaderBits(blk.litLens, blk.distLens);
-      if (mBits <= sBits) {
-        last.toks = allToks; last.litFreq = lf; last.distFreq = df; last.litLens = ll; last.distLens = dl; last.e = blk.e;
-        continue;
+  bw.write(isLast ? 1 : 0, 1);
+  if (!blk.useDyn) {
+    bw.write(1, 2); // fixed
+    const litCode = FIX_LIT_CODE;
+    for (let k = 0; k < blk.ntok; k++) {
+      if (blk.tokLen[k] === 0) { const s = blk.tokSym[k]; bw.writeCode(litCode[s], FIX_LIT_LEN[s]); }
+      else {
+        const s = blk.tokSym[k]; const L = blk.tokLen[k]; const D = blk.tokDist[k];
+        bw.writeCode(litCode[s], FIX_LIT_LEN[s]);
+        if (LEN_EB[L] > 0) bw.write(L - LEN_B[L], LEN_EB[L]);
+        bw.writeCode(DIST_SYM[D], 5);
+        if (DIST_EB[D] > 0) bw.write(D - DIST_B[D], DIST_EB[D]);
       }
     }
-    merged.push(blk);
+    bw.writeCode(litCode[256], 7);
+    return;
   }
-  blocks = merged;
-  // per-block dynamic vs fixed, emit with ONE shared bit writer
+  // dynamic
+  if (!kraftOk(blk.litLen, 15) || !kraftOk(blk.distLen, 7)) { kraftFail.n++; }
+  bw.write(2, 2);
+  const { litCount, distCount } = trimCounts(blk.litLen, blk.distLen);
+  const r = rleOf(blk.litLen, blk.distLen, litCount, distCount);
+  const clLen = buildLengths(r.clFreq, 7) ?? new Int32Array(19);
+  if (!kraftOk(clLen, 7)) kraftFail.n++;
+  let clCount = 19; while (clCount > 4 && clLen[CL_ORDER[clCount - 1]] === 0) clCount--;
+  bw.write(litCount - 257, 5); bw.write(distCount - 1, 5); bw.write(clCount - 4, 4);
+  for (let k = 0; k < clCount; k++) bw.write(clLen[CL_ORDER[k]], 3);
+  const clCode = canonicalCodes(clLen).code;
+  for (let k = 0; k < r.sym.length; k++) {
+    const s = r.sym[k]; bw.writeCode(clCode[s], clLen[s]);
+    if (r.ebits[k] > 0) bw.write(r.extra[k], r.ebits[k]);
+  }
+  const litCode = canonicalCodes(blk.litLen).code;
+  const distCode = canonicalCodes(blk.distLen).code;
+  for (let k = 0; k < blk.ntok; k++) {
+    if (blk.tokLen[k] === 0) { const s = blk.tokSym[k]; bw.writeCode(litCode[s], blk.litLen[s]); }
+    else {
+      const s = blk.tokSym[k]; const L = blk.tokLen[k]; const D = blk.tokDist[k];
+      bw.writeCode(litCode[s], blk.litLen[s]);
+      if (LEN_EB[L] > 0) bw.write(L - LEN_B[L], LEN_EB[L]);
+      const ds = DIST_SYM[D]; bw.writeCode(distCode[ds], blk.distLen[ds]);
+      if (DIST_EB[D] > 0) bw.write(D - DIST_B[D], DIST_EB[D]);
+    }
+  }
+  bw.writeCode(litCode[256], blk.litLen[256]);
+}
+
+// ---------- Compress one filtered stream with the custom DEFLATE ----------
+function compressCustom(data: Uint8Array, rowStride: number, iters: number, maxDepth: number, diag: any, period: number, dpCand: number): { zlib: Uint8Array; kraftFail: number; blocks: number; finder: Finder; } {
+  const finder = buildFinder(data, rowStride, maxDepth, period);
+  const rowLen = rowStride;
+  let blockBytes = 262144;
+  if (rowLen > 0) blockBytes = Math.max(rowLen, Math.floor(262144 / rowLen) * rowLen);
   const bw = new BitWriter();
-  let fixedCount = 0;
-  for (let k = 0; k < blocks.length; k++) {
-    const blk = blocks[k];
-    const dynBits = tokenBits(blk.toks, blk.litLens, blk.distLens) + dynamicHeaderBits(blk.litLens, blk.distLens);
-    const fixBits = tokenBits(blk.toks, FIXED_LIT, FIXED_DIST);
-    blk.useFixed = fixBits + 3 <= dynBits + 3;
-    if (blk.useFixed) fixedCount++;
-    if (!blk.useFixed && (!kraftCheck(blk.litLens, 15) || !kraftCheck(blk.distLens, 15))) kraftFail++;
-    emitBlock(bw, blk, k === blocks.length - 1);
+  let kraftFail = 0; let blocks = 0;
+  const kf = { n: 0 };
+  for (let bs = 0; bs < data.length; bs += blockBytes) {
+    const be = Math.min(data.length, bs + blockBytes);
+    const blk = parseBlock(data, finder, bs, be, iters, dpCand);
+    emitBlock(bw, blk, be >= data.length, kf);
+    blocks++;
   }
-  const deflate = bw.finish();
-  const zlib = new Uint8Array(2 + deflate.length + 4);
-  zlib[0] = 0x78; zlib[1] = 0x9c; zlib.set(deflate, 2);
-  new DataView(zlib.buffer).setUint32(2 + deflate.length, adler32(raw));
-  const visits = blocks.reduce((a, b) => a + (b.visits || 0), 0);
-  return { zlib, blocks: blocks.length, fixedCount, kraftFail, visits, rawLen: H };
+  kraftFail = kf.n;
+  const def = bw.finish();
+  const out = new Uint8Array(2 + def.length + 4);
+  out[0] = 0x78; out[1] = 0x9c; out.set(def, 2);
+  const v = new DataView(out.buffer); v.setUint32(2 + def.length, adler32(data));
+  if (diag) { diag.finderVisits = finder.visits; diag.finderPositions = finder.positions; diag.kraftFail = kraftFail; diag.blocks = blocks; diag.finder = finder; diag.data = data; }
+  return { zlib: out, kraftFail, blocks, finder };
 }
 
-// ---------- colour forms ----------
-function buildForms(rgba, w, h) {
-  const n = w * h;
-  const counts = new Map();
-  let grey = true, allOpaque = true, alphaOnly01 = true;
-  const transRGB = new Set();
-  for (let i = 0; i < n; i++) {
-    const r = rgba[i*4], g = rgba[i*4+1], b = rgba[i*4+2], a = rgba[i*4+3];
-    if (r !== g || g !== b) grey = false;
+// ---------- Colour forms ----------
+interface Form { ct: number; bpp: number; samples: Uint8Array; plte: Uint8Array | null; trns: Uint8Array | null; name: string; }
+function buildForms(rgba: Uint8Array): Form[] {
+  const forms: Form[] = [];
+  const cmap = new Map<number, number>();
+  let allGrey = true, allOpaque = true, alpha01 = true;
+  const transRGB = new Set<number>(); let transGrey = -1; let greyKeyOk = true;
+  for (let i = 0; i < N; i++) {
+    const r = rgba[i * 4], g = rgba[i * 4 + 1], b = rgba[i * 4 + 2], a = rgba[i * 4 + 3];
+    if (r !== g || g !== b) allGrey = false;
     if (a !== 255) allOpaque = false;
-    if (a !== 0 && a !== 255) alphaOnly01 = false;
-    if (a === 0) transRGB.add((r << 16) | (g << 8) | b);
+    if (a !== 0 && a !== 255) alpha01 = false;
+    if (a === 0) { transRGB.add((r << 16) | (g << 8) | b); if (transGrey === -1) transGrey = r; else if (r !== transGrey) greyKeyOk = false; }
     const key = (r << 24) | (g << 16) | (b << 8) | a;
-    counts.set(key, (counts.get(key) || 0) + 1);
+    cmap.set(key, (cmap.get(key) ?? 0) + 1);
   }
-  const forms = [];
-  const distinct = counts.size;
-  // palette forms
-  if (distinct <= 256) {
-    const cols = [...counts.entries()].sort((a, b) => b[1] - a[1]); // [key, count] freq order
-    const keys = cols.map(c => c[0]);
-    const freqs = cols.map(c => c[1]);
-    const orderings = [];
-    orderings.push({ name: 'pal-freq', order: keys.map((_, i) => i) });
-    // luminance
-    orderings.push({ name: 'pal-lum', order: keys.map((_, i) => i).sort((a, b) => { const ka = keys[a], kb = keys[b]; const la = 0.299*((ka>>>24)&255)+0.587*((ka>>>16)&255)+0.114*((ka>>>8)&255); const lb = 0.299*((kb>>>24)&255)+0.587*((kb>>>16)&255)+0.114*((kb>>>8)&255); return la - lb; }) });
-    // border-pinned: colours by border frequency first
-    const border = new Map();
-    for (let x = 0; x < w; x++) { for (const y of [0, h-1]) { const i = y*w+x; const k = (rgba[i*4]<<24)|(rgba[i*4+1]<<16)|(rgba[i*4+2]<<8)|rgba[i*4+3]; border.set(k, (border.get(k)||0)+1); } }
-    for (let y = 0; y < h; y++) { for (const x of [0, w-1]) { const i = y*w+x; const k = (rgba[i*4]<<24)|(rgba[i*4+1]<<16)|(rgba[i*4+2]<<8)|rgba[i*4+3]; border.set(k, (border.get(k)||0)+1); } }
-    orderings.push({ name: 'pal-border', order: keys.map((_, i) => i).sort((a, b) => ((border.get(keys[b])||0) - (border.get(keys[a])||0)) || freqs[b] - freqs[a]) });
-    // adjacency-optimized
-    const P = keys.length;
-    const idOf = new Map(keys.map((k, i) => [k, i]));
-    const S = new Float64Array(P * P); // symmetric adjacency counts
-    for (let y = 0; y < h; y++) {
-      const base = y * w;
-      for (let x = 0; x + 1 < w; x++) {
-        const a = idOf.get((rgba[(base+x)*4]<<24)|(rgba[(base+x)*4+1]<<16)|(rgba[(base+x)*4+2]<<8)|rgba[(base+x)*4+3]);
-        const b = idOf.get((rgba[(base+x+1)*4]<<24)|(rgba[(base+x+1)*4+1]<<16)|(rgba[(base+x+1)*4+2]<<8)|rgba[(base+x+1)*4+3]);
-        if (a !== b) { S[a*P+b]++; S[b*P+a]++; }
+  forms.push({ ct: 6, bpp: 4, samples: rgba, plte: null, trns: null, name: 'rgba' });
+  if (allOpaque || (alpha01 && transRGB.size === 1)) {
+    const s = new Uint8Array(N * 3);
+    for (let i = 0; i < N; i++) { s[i * 3] = rgba[i * 4]; s[i * 3 + 1] = rgba[i * 4 + 1]; s[i * 3 + 2] = rgba[i * 4 + 2]; }
+    let trns: Uint8Array | null = null;
+    if (!allOpaque) { const k = [...transRGB][0]; trns = new Uint8Array([0, (k >> 16) & 255, 0, (k >> 8) & 255, 0, k & 255]); }
+    forms.push({ ct: 2, bpp: 3, samples: s, plte: null, trns, name: 'rgb' });
+  }
+  if (allGrey) {
+    if (allOpaque) {
+      const s = new Uint8Array(N); for (let i = 0; i < N; i++) s[i] = rgba[i * 4];
+      forms.push({ ct: 0, bpp: 1, samples: s, plte: null, trns: null, name: 'grey' });
+    } else if (alpha01 && greyKeyOk) {
+      const s = new Uint8Array(N); for (let i = 0; i < N; i++) s[i] = rgba[i * 4];
+      forms.push({ ct: 0, bpp: 1, samples: s, plte: null, trns: new Uint8Array([0, transGrey]), name: 'grey-key' });
+    } else {
+      const s = new Uint8Array(N * 2); for (let i = 0; i < N; i++) { s[i * 2] = rgba[i * 4]; s[i * 2 + 1] = rgba[i * 4 + 3]; }
+      forms.push({ ct: 4, bpp: 2, samples: s, plte: null, trns: null, name: 'greyalpha' });
+    }
+  }
+  if (cmap.size <= 256) {
+    const cols = [...cmap.entries()];
+    const orderings: { name: string; ord: number[] }[] = [];
+    orderings.push({ name: 'freq', ord: cols.slice().sort((a, b) => b[1] - a[1]).map(e => e[0]) });
+    orderings.push({ name: 'lum', ord: cols.slice().sort((a, b) => { const la = 0.299 * ((a[0] >> 24) & 255) + 0.587 * ((a[0] >> 16) & 255) + 0.114 * ((a[0] >> 8) & 255); const lb = 0.299 * ((b[0] >> 24) & 255) + 0.587 * ((b[0] >> 16) & 255) + 0.114 * ((b[0] >> 8) & 255); return la - lb; }).map(e => e[0]) });
+    if (cmap.size <= 64) {
+      const pair = new Map<number, number>();
+      for (let y = 0; y < H; y++) for (let x = 0; x < W - 1; x++) {
+        const a = (rgba[(y * W + x) * 4] << 24) | (rgba[(y * W + x) * 4 + 1] << 16) | (rgba[(y * W + x) * 4 + 2] << 8) | rgba[(y * W + x) * 4 + 3];
+        const b = (rgba[(y * W + x + 1) * 4] << 24) | (rgba[(y * W + x + 1) * 4 + 1] << 16) | (rgba[(y * W + x + 1) * 4 + 2] << 8) | rgba[(y * W + x + 1) * 4 + 3];
+        if (a !== b) { const k = a * 4294967296 + (b >>> 0); pair.set(k, (pair.get(k) ?? 0) + 1); }
       }
-    }
-    const order = [0]; const used = new Uint8Array(P); used[0] = 1;
-    for (let k = 1; k < P; k++) {
-      const last = order[k-1]; let bestC = -1, bestV = -1;
-      for (let c = 0; c < P; c++) if (!used[c]) { const v = S[last*P+c]; if (v > bestV || (v === bestV && freqs[c] > freqs[bestC])) { bestV = v; bestC = c; } }
-      order.push(bestC); used[bestC] = 1;
-    }
-    // adjacent-swap local search on cost sum S[a][b]*|pos[a]-pos[b]|
-    const pos = new Int32Array(P);
-    for (let k = 0; k < P; k++) pos[order[k]] = k;
-    for (let pass = 0; pass < 3; pass++) {
-      let improved = false;
-      for (let k = 0; k + 1 < P; k++) {
-        const x = order[k], y = order[k+1];
-        let delta = 0;
-        for (let b = 0; b < P; b++) {
-          if (b === x || b === y) continue;
-          delta += S[x*P+b] * (Math.abs(k+1 - pos[b]) - Math.abs(k - pos[b]));
-          delta += S[y*P+b] * (Math.abs(k - pos[b]) - Math.abs(k+1 - pos[b]));
+      const freq = new Map(cols);
+      const remaining = new Set(cols.map(e => e[0]));
+      const ord: number[] = [];
+      let cur = cols.slice().sort((a, b) => b[1] - a[1])[0][0];
+      ord.push(cur); remaining.delete(cur);
+      while (remaining.size) {
+        let bestK = -1, bestV = -1;
+        for (const k of remaining) {
+          const v = (pair.get(cur * 4294967296 + (k >>> 0)) ?? 0) + (pair.get(k * 4294967296 + (cur >>> 0)) ?? 0);
+          const score = v * 1000 + (freq.get(k) ?? 0);
+          if (score > bestV) { bestV = score; bestK = k; }
         }
-        if (delta < 0) { order[k] = y; order[k+1] = x; pos[x] = k+1; pos[y] = k; improved = true; }
+        ord.push(bestK); remaining.delete(bestK); cur = bestK;
       }
-      if (!improved) break;
+      orderings.push({ name: 'adj', ord });
     }
-    orderings.push({ name: 'pal-adj', order });
+    // rank orderings by filter-None zlib level-1 size; keep the best two
+    const scored: { o: { name: string; ord: number[] }; s: Uint8Array; plte: Uint8Array; trns: Uint8Array | null; l1: number }[] = [];
     for (const o of orderings) {
-      const idx = new Map();
-      o.order.forEach((ci, pi) => idx.set(keys[ci], pi));
-      const samples = new Uint8Array(n);
-      for (let i = 0; i < n; i++) samples[i] = idx.get((rgba[i*4]<<24)|(rgba[i*4+1]<<16)|(rgba[i*4+2]<<8)|rgba[i*4+3]);
-      const palette = new Uint8Array(P * 3), trnsA = new Uint8Array(P);
-      let lastAlpha = -1;
-      o.order.forEach((ci, pi) => { const k = keys[ci]; palette[pi*3] = (k>>>24)&255; palette[pi*3+1] = (k>>>16)&255; palette[pi*3+2] = (k>>>8)&255; trnsA[pi] = k & 255; if (trnsA[pi] < 255) lastAlpha = pi; });
-      const trns = lastAlpha >= 0 ? trnsA.subarray(0, lastAlpha + 1) : null;
-      forms.push({ name: o.name, ct: 3, bpp: 1, samples, palette, trns, overhead: 12 + palette.length + (trns ? 12 + trns.length : 0) });
+      const idx = new Map<number, number>(); o.ord.forEach((k, i) => idx.set(k, i));
+      const s = new Uint8Array(N);
+      for (let i = 0; i < N; i++) { const k = (rgba[i * 4] << 24) | (rgba[i * 4 + 1] << 16) | (rgba[i * 4 + 2] << 8) | rgba[i * 4 + 3]; s[i] = idx.get(k)!; }
+      const plte = new Uint8Array(o.ord.length * 3); const trnsFull = new Uint8Array(o.ord.length);
+      o.ord.forEach((k, i) => { plte[i * 3] = (k >> 24) & 255; plte[i * 3 + 1] = (k >> 16) & 255; plte[i * 3 + 2] = (k >> 8) & 255; trnsFull[i] = k & 255; });
+      let trns: Uint8Array | null = null; let last = trnsFull.length - 1; while (last >= 0 && trnsFull[last] === 255) last--;
+      if (last >= 0) trns = trnsFull.subarray(0, last + 1);
+      const raw0 = applyFilters(s, 1, new Uint8Array(H).fill(0));
+      scored.push({ o, s, plte, trns, l1: deflateSync(raw0, { level: 1 }).length });
     }
+    scored.sort((a, b) => a.l1 - b.l1);
+    for (const sc of scored.slice(0, 2)) forms.push({ ct: 3, bpp: 1, samples: sc.s, plte: sc.plte, trns: sc.trns, name: 'pal-' + sc.o.name });
   }
-  // grey forms
-  if (grey) {
-    const g = new Uint8Array(n); for (let i = 0; i < n; i++) g[i] = rgba[i*4];
-    const a = new Uint8Array(n); for (let i = 0; i < n; i++) a[i] = rgba[i*4+3];
-    let hasAlpha = false; for (let i = 0; i < n; i++) if (a[i] !== 255) { hasAlpha = true; break; }
-    if (!hasAlpha) forms.push({ name: 'grey', ct: 0, bpp: 1, samples: g, palette: null, trns: null, overhead: 0 });
-    else {
-      const ga = new Uint8Array(n * 2); for (let i = 0; i < n; i++) { ga[i*2] = g[i]; ga[i*2+1] = a[i]; }
-      forms.push({ name: 'grey-alpha', ct: 4, bpp: 2, samples: ga, palette: null, trns: null, overhead: 0 });
-      if (alphaOnly01 && transRGB.size === 1) {
-        const key = [...transRGB][0];
-        const trns = new Uint8Array([0, (key >> 16) & 255]);
-        forms.push({ name: 'grey-trns', ct: 0, bpp: 1, samples: g, palette: null, trns, overhead: 12 + 2 });
-      }
-    }
-  }
-  // RGB / RGB-trns
-  if (allOpaque) {
-    const rgb = new Uint8Array(n * 3); for (let i = 0; i < n; i++) { rgb[i*3] = rgba[i*4]; rgb[i*3+1] = rgba[i*4+1]; rgb[i*3+2] = rgba[i*4+2]; }
-    forms.push({ name: 'rgb', ct: 2, bpp: 3, samples: rgb, palette: null, trns: null, overhead: 0 });
-  } else if (alphaOnly01 && transRGB.size === 1) {
-    const key = [...transRGB][0];
-    const rgb = new Uint8Array(n * 3); for (let i = 0; i < n; i++) { rgb[i*3] = rgba[i*4]; rgb[i*3+1] = rgba[i*4+1]; rgb[i*3+2] = rgba[i*4+2]; }
-    const trns = new Uint8Array([0, (key>>16)&255, 0, (key>>8)&255, 0, key&255]);
-    forms.push({ name: 'rgb-trns', ct: 2, bpp: 3, samples: rgb, palette: null, trns, overhead: 12 + 6 });
-  }
-  // RGBA always
-  forms.push({ name: 'rgba', ct: 6, bpp: 4, samples: rgba, palette: null, trns: null, overhead: 0 });
-  for (const f of forms) f.distinct = distinct;
   return forms;
 }
 
-// ---------- filter contest ----------
-function viterbi(costs, penalty, h) { // costs: [5][h] Float64Array
-  const dp = new Float64Array(5), back = new Int8Array(h * 5);
-  for (let t = 0; t < 5; t++) dp[t] = costs[t][0];
-  for (let y = 1; y < h; y++) {
+function applyFilters(samples: Uint8Array, bpp: number, choice: Uint8Array): Uint8Array {
+  const stride = W * bpp; const raw = new Uint8Array(H * (stride + 1));
+  const tmp = new Uint8Array(stride);
+  for (let y = 0; y < H; y++) {
+    const cur = samples.subarray(y * stride, (y + 1) * stride);
+    const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
+    filterRow(choice[y], cur, prev, bpp, tmp);
+    raw[y * (stride + 1)] = choice[y]; raw.set(tmp, y * (stride + 1) + 1);
+  }
+  return raw;
+}
+function applyFiltersFrom(filt: Uint8Array[], bpp: number, choice: Uint8Array): Uint8Array {
+  const stride = W * bpp; const raw = new Uint8Array(H * (stride + 1));
+  for (let y = 0; y < H; y++) {
+    const t = choice[y];
+    raw[y * (stride + 1)] = t;
+    raw.set(filt[t].subarray(y * stride, (y + 1) * stride), y * (stride + 1) + 1);
+  }
+  return raw;
+}
+function viterbi(costs: Float64Array, penalty: number): Uint8Array {
+  const dp = new Float64Array(5); const back = new Uint8Array(H * 5);
+  for (let t = 0; t < 5; t++) dp[t] = costs[t];
+  for (let y = 1; y < H; y++) {
     const ndp = new Float64Array(5).fill(Infinity);
-    for (let t = 0; t < 5; t++) {
-      let best = Infinity, bp = 0;
-      for (let p = 0; p < 5; p++) { const c = dp[p] + (p === t ? 0 : penalty) + costs[t][y]; if (c < best) { best = c; bp = p; } }
-      ndp[t] = best; back[y*5+t] = bp;
-    }
+    for (let t = 0; t < 5; t++) for (let p = 0; p < 5; p++) { const c = dp[p] + (p === t ? 0 : penalty) + costs[y * 5 + t]; if (c < ndp[t]) { ndp[t] = c; back[y * 5 + t] = p; } }
     dp.set(ndp);
   }
-  let last = 0; for (let t = 1; t < 5; t++) if (dp[t] < dp[last]) last = t;
-  const seq = new Uint8Array(h); seq[h-1] = last;
-  for (let y = h - 1; y >= 1; y--) { last = back[y*5+last]; seq[y-1] = last; }
-  return seq;
+  let best = 0; for (let t = 1; t < 5; t++) if (dp[t] < dp[best]) best = t;
+  const choice = new Uint8Array(H);
+  for (let y = H - 1; y >= 0; y--) { choice[y] = best; best = back[y * 5 + best]; }
+  return choice;
 }
-function stripSeq(costs, stripSize, penalty, h) {
-  const ns = Math.ceil(h / stripSize);
-  const sc = [];
-  for (let t = 0; t < 5; t++) { const a = new Float64Array(ns); for (let s = 0; s < ns; s++) { let sum = 0; for (let y = s*stripSize; y < Math.min(h, (s+1)*stripSize); y++) sum += costs[t][y]; a[s] = sum; } sc.push(a); }
-  const sseq = viterbi(sc, penalty, ns);
-  const seq = new Uint8Array(h);
-  for (let s = 0; s < ns; s++) for (let y = s*stripSize; y < Math.min(h, (s+1)*stripSize); y++) seq[y] = sseq[s];
-  return seq;
-}
-function bandSeq(costs, bandSize, h) {
-  const seq = new Uint8Array(h);
-  for (let s = 0; s * bandSize < h; s++) {
-    let bestT = 0, bestC = Infinity;
-    for (let t = 0; t < 5; t++) { let sum = 0; for (let y = s*bandSize; y < Math.min(h, (s+1)*bandSize); y++) sum += costs[t][y]; if (sum < bestC) { bestC = sum; bestT = t; } }
-    for (let y = s*bandSize; y < Math.min(h, (s+1)*bandSize); y++) seq[y] = bestT;
-  }
-  return seq;
-}
-function seqCost(seq, costs, h) { let s = 0; for (let y = 0; y < h; y++) s += costs[seq[y]][y]; return s; }
-function snapSeq(seq, costs, h) {
-  const out = Uint8Array.from(seq);
-  const bounds = () => { const b = []; for (let y = 1; y < h; y++) if (out[y] !== out[y-1]) b.push(y); return b; };
-  for (const step of [5, 2, 1]) {
-    for (const b of bounds()) {
-      const prevB = (() => { let p = 0; for (let y = 1; y < b; y++) if (out[y] !== out[y-1]) p = y; return p; })();
-      const nextB = (() => { for (let y = b + 1; y < h; y++) if (out[y] !== out[y-1]) return y; return h; })();
-      let bestD = 0, bestS = Infinity;
-      const lo = Math.max(0, b - 12), hi = Math.min(h - 1, b + 12);
-      const scoreAt = (bb) => { let s = 0; for (let y = Math.max(0, b-13); y < Math.min(h, b+13); y++) { const t = y < bb ? out[b-1] : out[b]; s += costs[t][y]; } return s; };
-      bestS = scoreAt(b);
-      for (let d = -12; d <= 12; d += step) {
-        if (!d) continue;
-        const bb = b + d;
-        if (bb <= prevB || bb >= nextB || bb < 1 || bb >= h) continue;
-        const s = scoreAt(bb);
-        if (s < bestS) { bestS = s; bestD = d; }
-      }
-      if (bestD) {
-        const nb = b + bestD;
-        const from = out[b-1], to = out[b];
-        for (let y = Math.min(b, nb); y < Math.max(b, nb); y++) out[y] = bestD > 0 ? from : to;
-      }
-    }
-  }
-  return out;
-}
-function greedyCosts(F, w, h, bpp) {
-  // per-row per-filter lazy-match token costs (fixed-Huffman approx), charged to rows
-  const rowLen = w * bpp + 1;
-  const costs = [];
+
+// Filter contest for one form (cheap candidates). Returns candidates ranked by zlib
+// level-1 size, plus the filtered streams so the brute candidate can be added later.
+function filterContest(form: Form): { ranked: { cand: { name: string; choice: Uint8Array }; raw: Uint8Array; l1: number }[]; filt: Uint8Array[]; stride: number } {
+  const { samples, bpp } = form; const stride = W * bpp;
+  const filt: Uint8Array[] = [];
   for (let t = 0; t < 5; t++) {
-    const data = F[t], n = data.length;
-    const rowCost = new Float64Array(h);
-    const head = new Int32Array(65536).fill(-1);
-    let p = 0;
-    while (p < n) {
-      const row = Math.floor(p / rowLen);
-      if (p + 2 < n) {
-        const hh = (((data[p]*257 + data[p+1])*257 + data[p+2]) * 2654435761) >>> 16 & 65535;
-        const cand = head[hh];
-        let len = 0;
-        if (cand >= 0 && p - cand <= 32768 && data[cand] === data[p] && data[cand+1] === data[p+1] && data[cand+2] === data[p+2]) {
-          len = 3; const lim = Math.min(258, n - p);
-          while (len < lim && data[cand+len] === data[p+len]) len++;
-        }
-        if (len >= 3) {
-          const ls = lenSym(len), ds = distSym(p - cand);
-          const bits = FIXED_LIT[ls] + LEN_EXTRA[ls-257] + 5 + DIST_EXTRA[ds];
-          // charge across rows spanned
-          let left = len, at = p;
-          while (left > 0) { const r = Math.floor(at / rowLen); const seg = Math.min(left, (r+1)*rowLen - at); rowCost[r] += bits * seg / len; at += seg; left -= seg; }
-          head[hh] = p; p += len;
-        } else {
-          rowCost[row] += FIXED_LIT[data[p]];
-          head[hh] = p; p++;
-        }
-      } else { rowCost[row] += FIXED_LIT[data[p]]; p++; }
+    const f = new Uint8Array(N * bpp); const tmp = new Uint8Array(stride);
+    for (let y = 0; y < H; y++) {
+      const cur = samples.subarray(y * stride, (y + 1) * stride);
+      const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
+      filterRow(t, cur, prev, bpp, tmp); f.set(tmp, y * stride);
     }
-    costs.push(rowCost);
+    filt.push(f);
   }
-  return costs;
-}
-function entropyCosts(F, w, h, bpp) {
-  const rowLen = w * bpp + 1;
-  const costs = [];
-  for (let t = 0; t < 5; t++) {
-    const data = F[t];
-    const freq = new Float64Array(256);
-    for (let i = 0; i < data.length; i += 4) freq[data[i]]++;
-    const bits = new Float64Array(256);
-    for (let b = 0; b < 256; b++) bits[b] = freq[b] > 0 ? Math.max(0.5, Math.min(15, -Math.log2(freq[b] / (data.length / 4)))) : 15;
-    const rowCost = new Float64Array(h);
-    // row sums sampled at 1-in-2 bytes (x2 to keep scale vs greedy costs); the
-    // cheap cost only ranks finalists, and size-1 arbitrates the winner
-    for (let y = 0; y < h; y++) { let s = 0; const base = y * rowLen; for (let i = 1; i < rowLen; i += 2) s += bits[data[base+i]]; rowCost[y] = s * 2; }
-    costs.push(rowCost);
+  const entCosts = new Float64Array(H * 5); const rowSum = new Float64Array(H * 5);
+  const hist = new Int32Array(256);
+  for (let y = 0; y < H; y++) for (let t = 0; t < 5; t++) {
+    const row = filt[t].subarray(y * stride, (y + 1) * stride);
+    hist.fill(0); let ss = 0;
+    for (let i = 0; i < stride; i++) { hist[row[i]]++; const v = row[i]; ss += v < 128 ? v : 256 - v; }
+    rowSum[y * 5 + t] = ss;
+    let bits = 0; for (let v = 0; v < 256; v++) { const c = hist[v]; if (c) bits += c * (Math.log2(stride) - Math.log2(c)); }
+    entCosts[y * 5 + t] = bits;
   }
-  return costs;
+  const cands: { name: string; choice: Uint8Array }[] = [];
+  const push = (name: string, choice: Uint8Array) => {
+    if (!cands.some(c => { for (let y = 0; y < H; y++) if (c.choice[y] !== choice[y]) return false; return true; })) cands.push({ name, choice });
+  };
+  push('f0', new Uint8Array(H).fill(0));
+  push('f2', new Uint8Array(H).fill(2));
+  push('f4', new Uint8Array(H).fill(4));
+  { const choice = new Uint8Array(H); for (let y = 0; y < H; y++) { let best = 0; for (let t = 1; t < 5; t++) if (rowSum[y * 5 + t] < rowSum[y * 5 + best]) best = t; choice[y] = best; } push('minsum', choice); }
+  if (form.ct === 3) {
+    const choice = new Uint8Array(H);
+    for (let y = 0; y < H; y++) {
+      if (y === 0) { choice[y] = 0; continue; }
+      const cur = samples.subarray(y * stride, (y + 1) * stride); const prev = samples.subarray((y - 1) * stride, y * stride);
+      let same = true, change = false;
+      for (let i = 0; i < stride; i++) { if (cur[i] !== prev[i]) { same = false; break; } if (i > 0 && cur[i] !== cur[i - 1]) change = true; }
+      choice[y] = same && change ? 2 : 0;
+    }
+    push('smartup', choice);
+  }
+  push('vit0', viterbi(entCosts, 0));
+  push('vit256', viterbi(entCosts, 256));
+  const ranked = cands.map(cand => { const raw = applyFiltersFrom(filt, bpp, cand.choice); return { cand, raw, l1: deflateSync(raw, { level: 1 }).length }; });
+  ranked.sort((a, b) => a.l1 - b.l1);
+  return { ranked, filt, stride };
 }
-function bruteForceSeq(F, samples, w, h, bpp) {
-  const rowLen = w * bpp + 1;
-  const seq = new Uint8Array(h);
-  const stream = new Uint8Array(h * rowLen); // chosen filtered stream (dict = its tail)
-  const tmp = new Uint8Array(rowLen);
-  for (let y = 0; y < h; y++) {
-    let bestT = 0, bestSize = Infinity;
-    const off = y * rowLen;
-    const dict = off > 0 ? stream.subarray(Math.max(0, off - 32768), off) : undefined;
+// Per-row brute force (R3's method), added only for forms near the lead: each row
+// compressed with a mid-level compressor using the previous 32 KiB of chosen
+// filtered output as dictionary.
+function addBrute(form: Form, contest: { ranked: { cand: { name: string; choice: Uint8Array }; raw: Uint8Array; l1: number }[]; filt: Uint8Array[]; stride: number }): void {
+  const { filt, stride } = contest; const bpp = form.bpp;
+  const choice = new Uint8Array(H);
+  const dictBuf = new Uint8Array(H * (stride + 1));
+  let dictLen = 0;
+  const rowBuf = new Uint8Array(stride + 1);
+  for (let y = 0; y < H; y++) {
+    let bestT = 0, bestLen = Infinity;
+    const dict = dictBuf.subarray(Math.max(0, dictLen - 32768), dictLen);
     for (let t = 0; t < 5; t++) {
-      tmp[0] = t;
-      tmp.set(F[t].subarray(y*rowLen+1, (y+1)*rowLen), 1);
-      const sz = deflateRawSync(tmp, { level: 6, dictionary: dict }).length;
-      if (sz < bestSize) { bestSize = sz; bestT = t; }
+      rowBuf[0] = t; rowBuf.set(filt[t].subarray(y * stride, (y + 1) * stride), 1);
+      const len = deflateSync(rowBuf, { level: 6, dictionary: dict }).length;
+      if (len < bestLen) { bestLen = len; bestT = t; }
     }
-    seq[y] = bestT;
-    stream[off] = bestT;
-    stream.set(F[bestT].subarray(y*rowLen+1, (y+1)*rowLen), off+1);
+    choice[y] = bestT;
+    rowBuf[0] = bestT; rowBuf.set(filt[bestT].subarray(y * stride, (y + 1) * stride), 1);
+    dictBuf.set(rowBuf, dictLen); dictLen += stride + 1;
   }
-  return seq;
+  const cand = { name: 'brute', choice };
+  const raw = applyFiltersFrom(filt, bpp, choice);
+  contest.ranked.push({ cand, raw, l1: deflateSync(raw, { level: 1 }).length });
+  contest.ranked.sort((a, b) => a.l1 - b.l1);
 }
 
-// ---------- filter contest driver ----------
-function smartUpSeq(samples, w, h, bpp) {
-  const stride = w * bpp, seq = new Uint8Array(h);
-  for (let y = 0; y < h; y++) {
-    let same = false, change = false;
-    if (y > 0) {
-      same = true;
-      for (let i = 0; i < stride; i++) if (samples[y*stride+i] !== samples[(y-1)*stride+i]) { same = false; break; }
+// ---------- Finder diagnostic (brute force, sampled) ----------
+function finderDiag(data: Uint8Array, finder: Finder): { sampled: number; noMatch: number; strict: number; visitsPerPos: number } {
+  const n = data.length; const nsamp = 150; const step = Math.max(1, Math.floor(n / nsamp));
+  let sampled = 0, noMatch = 0, strict = 0;
+  for (let k = 0; k < nsamp; k++) {
+    const pos = Math.min(n - 4, k * step + 7);
+    if (pos < 4) continue;
+    const lim = Math.min(pos, 32768);
+    let brute = 0;
+    for (let d = 1; d <= lim; d++) {
+      const p = pos - d;
+      if (data[p] !== data[pos] || data[p + 1] !== data[pos + 1] || data[p + 2] !== data[pos + 2]) continue;
+      const ml = matchLen(data, p, pos, 258);
+      if (ml > brute) brute = ml;
+      if (brute >= 258) break;
     }
-    if (same) { for (let i = bpp; i < stride; i++) if (samples[y*stride+i] !== samples[y*stride+i-bpp]) { change = true; break; } }
-    seq[y] = same && change ? 2 : 0;
+    if (brute < 32) continue;
+    sampled++;
+    const fb = finder.bestLen[pos];
+    if (fb < 3) noMatch++;
+    if (fb < brute - 3) strict++;
   }
-  return seq;
-}
-function filterContest(form, w, h, isTop) {
-  const { samples, bpp, ct } = form;
-  const stride = w * bpp, rowLen = stride + 1;
-  const F = buildFiltered(samples, w, h, bpp);
-  const ent = entropyCosts(F, w, h, bpp);
-  let hybrid = ent;
-  if (isTop && bpp === 1) {
-    const g = greedyCosts(F, w, h, bpp);
-    hybrid = [];
-    for (let t = 0; t < 5; t++) { const a = new Float64Array(h); for (let y = 0; y < h; y++) a[y] = Math.min(ent[t][y], g[t][y]); hybrid.push(a); }
-  }
-  const cands = [];
-  const add = (name, seq) => cands.push({ name, seq });
-  for (let t = 0; t < 5; t++) { const s = new Uint8Array(h).fill(t); add('fixed' + t, s); }
-  // minsum
-  { const s = new Uint8Array(h); const tmp = new Uint8Array(stride);
-    for (let y = 0; y < h; y++) { let best = Infinity, bt = 0; for (let t = 0; t < 5; t++) { const ss = signedSum(F[t].subarray(y*rowLen+1, (y+1)*rowLen)); if (ss < best) { best = ss; bt = t; } } s[y] = bt; }
-    add('minsum', s); }
-  { const s = new Uint8Array(h); for (let y = 0; y < h; y++) { let bt = 0; for (let t = 1; t < 5; t++) if (ent[t][y] < ent[bt][y]) bt = t; s[y] = bt; } add('perRowEnt', s); }
-  { const s = new Uint8Array(h); for (let y = 0; y < h; y++) { let bt = 0; for (let t = 1; t < 5; t++) if (hybrid[t][y] < hybrid[bt][y]) bt = t; s[y] = bt; } add('perRowHyb', s); }
-  const pens = bpp === 1 ? [0, 32, 96, 256, 640, 1600, 4000] : [400, 1600, 1200, 2400];
-  let bestVit = null, bestVitCost = Infinity;
-  for (const p of pens) {
-    const s = viterbi(hybrid, p, h); add('vit' + p, s);
-    const c = seqCost(s, hybrid, h); if (c < bestVitCost) { bestVitCost = c; bestVit = s; }
-  }
-  for (const p of [25, 65]) add('strip10-' + p, stripSeq(hybrid, 10, p, h));
-  if (F[0].length > 200000) for (const p of [40, 85]) add('strip16-' + p, stripSeq(hybrid, 16, p, h));
-  add('band16', bandSeq(hybrid, 16, h));
-  add('band32', bandSeq(hybrid, 32, h));
-  if (bestVit) add('vitSnap', snapSeq(bestVit, hybrid, h));
-  if (ct === 3) add('smartUp', smartUpSeq(samples, w, h, bpp));
-  // Finalists: top 4 by cheap hybrid cost PLUS all five fixed filters, minsum and
-  // brute force — always. (Measured: fixed-0 is the best filter on i002/i007 under
-  // zlib-9 but ranks low by cheap entropy cost, so a cheap-only shortlist loses it.)
-  const finalists = [];
-  const pushC = (c) => { if (c && !finalists.some(x => x.name === c.name)) finalists.push(c); };
-  const ranked = cands.map(c => ({ c, cheap: seqCost(c.seq, hybrid, h) / 8 })).sort((a, b) => a.cheap - b.cheap);
-  ranked.slice(0, 4).forEach(r => pushC(r.c));
-  for (let t = 0; t < 5; t++) pushC(cands.find(c => c.name === 'fixed' + t));
-  pushC(cands.find(c => c.name === 'minsum'));
-  if (isTop) pushC({ name: 'brute', seq: bruteForceSeq(F, samples, w, h, bpp) });
-  const scored = [];
-  const dbg = process.env.MAKEFUN_DEBUG;
-  for (const c of (dbg === '2' ? cands.concat(isTop ? [{ name: 'brute', seq: bruteForceSeq(F, samples, w, h, bpp) }] : []) : finalists)) {
-    const stream = streamFromSeq(F, c.seq, w, h, bpp);
-    const size1 = deflateRawSync(stream, { level: 1 }).length;
-    const size9 = dbg === '2' ? deflateSync(stream, { level: 9 }).length : 0;
-    if (dbg === '2') console.error(JSON.stringify({ cand: c.name, size1, size9 }));
-    scored.push({ name: c.name, seq: c.seq, stream, score: size1, size1 });
-  }
-  let best;
-  if (isTop && dbg !== '2') {
-    // Re-rank the top 3 by size-1 (plus fixed-0 if it is not among them) with zlib
-    // level 6: level-1 ranking misranks multi-byte photo streams badly.
-    const top3 = scored.slice().sort((a, b) => a.score - b.score).slice(0, 3);
-    const f0 = scored.find(s => s.name === 'fixed0');
-    if (f0 && !top3.includes(f0)) top3.push(f0);
-    for (const s of top3) s.size6 = deflateSync(s.stream, { level: 6 }).length;
-    best = top3.slice().sort((a, b) => a.size6 - b.size6)[0];
-  } else {
-    best = scored.slice().sort((a, b) => a.score - b.score)[0];
-  }
-  return best;
+  return { sampled, noMatch, strict, visitsPerPos: finder.visits / Math.max(1, finder.positions) };
 }
 
-// ---------- main ----------
-const cpuTot = { forms: 0, filter: 0, parse: 0, other: 0 };
-function cpuMs(since) { const u = process.cpuUsage(since); return (u.user + u.system) / 1000; }
-const ids = readdirSync(NODE).sort();
-for (const id of ids) {
-  const t0 = process.cpuUsage();
-  const { w, h, rgba } = decodePng(new Uint8Array(readFileSync(join(NODE, id, 'image.png'))));
-  const forms = buildForms(rgba, w, h);
-  // screen forms by filter-0 zlib-1 size + overhead
-  const stride0 = (f) => w * f.bpp + 1;
-  const screened = forms.map(f => {
-    const rl = stride0(f);
-    const raw0 = new Uint8Array(h * rl);
-    for (let y = 0; y < h; y++) { raw0[y*rl] = 0; raw0.set(f.samples.subarray(y*w*f.bpp, (y+1)*w*f.bpp), y*rl+1); }
-    return { f, score: deflateRawSync(raw0, { level: 1 }).length + f.overhead };
-  }).sort((a, b) => a.score - b.score);
-  // stage 2: forms within 1.6x of the best filter-0 score get a fixed-filter screen
-  // (filter-0 alone misranks grey/photo forms, where Sub/Paeth win by a lot)
-  const best0 = screened[0].score;
-  const stage2 = screened.filter(s => s.score <= best0 * 1.35).map(s => {
-    const F = buildFiltered(s.f.samples, w, h, s.f.bpp);
-    let m = Infinity;
-    for (const t of [0, 1, 2, 4]) m = Math.min(m, deflateRawSync(F[t], { level: 1 }).length);
-    return { f: s.f, score: m + s.f.overhead };
-  }).sort((a, b) => a.score - b.score);
-  if (stage2.length < 2 && screened.length > stage2.length) stage2.push(screened.find(s => !stage2.some(x => x.f === s.f)));
-  const topForms = stage2.slice(0, 2);
-  if (process.env.MAKEFUN_DEBUG) console.error(JSON.stringify({ id, screened: screened.map(s => [s.f.name, s.score]) }));
-  const tForms = process.cpuUsage();
-  cpuTot.forms += cpuMs(t0);
-  let winner = null;
-  for (let k = 0; k < topForms.length; k++) {
-    const r = filterContest(topForms[k].f, w, h, k === 0);
-    if (process.env.MAKEFUN_DEBUG) console.error(JSON.stringify({ id, form: topForms[k].f.name, method: r.name, score: Math.round(r.score), size1: r.size1 }));
-    const tot = r.score + topForms[k].f.overhead;
-    if (!winner || tot < winner.tot) winner = { ...r, form: topForms[k].f, tot };
+// ---------- Encode one instance ----------
+const SCALE: Record<string, number> = { i001: 13547, i002: 55063, i003: 107892, i004: 110521, i005: 18669, i006: 185295, i007: 64285, i008: 26807 };
+function cpuMs(u: NodeJS.CpuUsage): number { return (u.user + u.system) / 1000; }
+function encodeOne(id: string): any {
+  const diag: any = { id };
+  const t0 = DIAG ? process.cpuUsage() : null;
+  const rgba = decode(readFileSync(join(I, id, 'image.png')));
+  const forms = buildForms(rgba);
+  const t1 = DIAG ? process.cpuUsage() : null;
+  if (DIAG) diag.formsMs = t0 ? cpuMs(process.cpuUsage(t0)) : 0;
+  // per-form contest (cheap candidates first), ranked by zlib L1
+  const perForm: { form: Form; contest: { ranked: { cand: { name: string; choice: Uint8Array }; raw: Uint8Array; l1: number }[]; filt: Uint8Array[]; stride: number } }[] = [];
+  for (const form of forms) perForm.push({ form, contest: filterContest(form) });
+  perForm.sort((a, b) => a.contest.ranked[0].l1 - b.contest.ranked[0].l1);
+  // brute-force filter candidate only for the lead form
+  const leadL1 = perForm[0].contest.ranked[0].l1;
+  addBrute(perForm[0].form, perForm[0].contest);
+  perForm.sort((a, b) => a.contest.ranked[0].l1 - b.contest.ranked[0].l1);
+  const t2 = DIAG ? process.cpuUsage() : null;
+  if (DIAG) diag.filterMs = t1 ? cpuMs(process.cpuUsage(t1)) : 0;
+  let best: { total: number; form: Form; def: Uint8Array; candName: string; customLen: number; libLen: number; diagFinder: any; iters: number } | null = null;
+  const tParse0 = DIAG ? process.cpuUsage() : null;
+  const evalForms = perForm.slice(0, 2);
+  for (let fi = 0; fi < evalForms.length; fi++) {
+    const pf = evalForms[fi];
+    const form = pf.form;
+    const overhead = (form.plte ? form.plte.length + 12 : 0) + (form.trns ? form.trns.length + 12 : 0) + 57;
+    // best form gets full budgets; a second form gets a lib-first gate (custom beats
+    // the library by ~10% on multi-byte streams and up to ~16% on 1-byte streams,
+    // so skip it only when even the library cannot reach the lead) and reduced
+    // iterations.
+    const isBestForm = fi === 0;
+    const itersFull = form.bpp === 1 ? ITERS_FLAT : ITERS_RICH;
+    const depth = form.bpp === 1 ? DEPTH_FLAT : DEPTH_RICH;
+    const dpCand = 4;
+    const rowStride = W * form.bpp + 1;
+    const candList = pf.contest.ranked.slice(0, 1);
+    for (const top of candList) {
+      const lib = deflateSync(top.raw, { level: 9 });
+      // gate every candidate by its own library size: a candidate whose library
+      // encoding cannot reach the current best (allowing for custom beating the
+      // library by ~10% multi-byte / ~18% 1-byte) is not worth a custom parse
+      const gate = form.bpp === 1 ? 1.05 : 1.12;
+      if (best && lib.length + overhead > best.total * gate) {
+        if (DIAG) diag['form_' + form.name + '_' + top.cand.name] = { cand: top.cand.name, skipped: 'lib-gate', lib: lib.length };
+        continue;
+      }
+      const iters = isBestForm ? itersFull : (form.bpp === 1 ? 6 : 2);
+      const d2: any = {};
+      const custom = compressCustom(top.raw, rowStride, iters, depth, DIAG ? d2 : null, form.bpp, dpCand);
+      const useCustom = custom.zlib.length <= lib.length;
+      const def = useCustom ? custom.zlib : lib;
+      const total = def.length + overhead;
+      let fd: any = null;
+      if (DIAG) fd = finderDiag(top.raw, custom.finder);
+      if (!best || total < best.total) best = { total, form, def, candName: top.cand.name, customLen: custom.zlib.length, libLen: lib.length, diagFinder: fd, iters };
+      if (DIAG) diag['form_' + form.name + '_' + top.cand.name] = { cand: top.cand.name, custom: custom.zlib.length, lib: lib.length, kraftFail: custom.kraftFail, blocks: custom.blocks, visitsPerPos: custom.finder.visits / Math.max(1, custom.finder.positions), finderDiag: fd };
+    }
   }
-  const tFilter = process.cpuUsage();
-  cpuTot.filter += cpuMs(tForms);
-  const isFlat = winner.form.ct === 3;
-  const isDense = winner.form.distinct > 20000;
-  const custom = compressStream(winner.stream, winner.seq, w, h, winner.form.bpp, isFlat, isDense);
-  const lib = deflateSync(winner.stream, { level: 9 });
-  const tParse = process.cpuUsage();
-  cpuTot.parse += cpuMs(tFilter);
-  const chosenStream = custom.zlib.length <= lib.length ? custom.zlib : lib;
-  const chosenKind = custom.zlib.length <= lib.length ? 'custom' : 'lib';
-  const chunks = [['IHDR', ihdrOf(w, h, winner.form.ct)]];
-  if (winner.form.ct === 3) chunks.push(['PLTE', winner.form.palette]);
-  if (winner.form.trns) chunks.push(['tRNS', winner.form.trns]);
-  chunks.push(['IDAT', chosenStream]);
-  chunks.push(['IEND', new Uint8Array(0)]);
-  const png = pngOf(chunks.map(([t, d]) => chunk(t, d)));
-  mkdirSync(join(OUTD, id), { recursive: true });
-  writeFileSync(join(OUTD, id, 'image.png'), png);
-  const tEnd = process.cpuUsage();
-  cpuTot.other += cpuMs(tParse);
-  console.error(JSON.stringify({ id, form: winner.form.name, method: winner.method, filterScore: Math.round(winner.score), custom: custom.zlib.length, lib: lib.length, chosen: chosenKind, fileBytes: png.length, blocks: custom.blocks, fixedBlocks: custom.fixedCount, kraftFail: custom.kraftFail, visits: custom.visits, cpuMs: Math.round(cpuMs(t0)) }));
+  if (DIAG) diag.parseMs = tParse0 ? cpuMs(process.cpuUsage(tParse0)) : 0;
+  const f = best!;
+  diag.form = f.form.name; diag.filter = f.candName; diag.customLen = f.customLen; diag.libLen = f.libLen;
+  diag.bytes = f.total; diag.points = Math.round(1000 * (2 * SCALE[id] - f.total) / (2 * SCALE[id] - SCALE[id] / 2) * 1000) / 1000;
+  const parts: Uint8Array[] = [chunk('IHDR', ihdr(f.form.ct))];
+  if (f.form.plte) parts.push(chunk('PLTE', f.form.plte));
+  if (f.form.trns) parts.push(chunk('tRNS', f.form.trns));
+  parts.push(chunk('IDAT', f.def));
+  parts.push(chunk('IEND', new Uint8Array(0)));
+  mkdirSync(join(O, id), { recursive: true });
+  writeFileSync(join(O, id, 'image.png'), pngOf(parts));
+  return diag;
 }
-console.error(JSON.stringify({ summary: true, cpuMs: { forms: Math.round(cpuTot.forms), filter: Math.round(cpuTot.filter), parse: Math.round(cpuTot.parse), other: Math.round(cpuTot.other), total: Math.round(cpuTot.forms + cpuTot.filter + cpuTot.parse + cpuTot.other) } }));
+
+const diags: any[] = [];
+for (const id of readdirSync(I).sort()) {
+  const d = encodeOne(id);
+  if (DIAG) { diags.push(d); console.error(JSON.stringify(d)); }
+}
+if (DIAG) {
+  const tot = diags.reduce((a, d) => a + d.points, 0) / diags.length;
+  console.error('SCORE_EST ' + Math.round(tot * 1000));
+}
