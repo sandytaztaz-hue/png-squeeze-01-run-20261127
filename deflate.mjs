@@ -1,365 +1,616 @@
-// deflate.mjs — from-scratch optimal-parse DEFLATE (zopfli-style), Node stdlib only.
-// API: deflateOpt(data: Uint8Array, opts) -> Uint8Array raw deflate stream.
-const LB = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
-const LE = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
-const DB = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
-const DE = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
-const LS = new Int32Array(259), DS = new Int32Array(32769);
-for (let s = 0; s < 29; s++) for (let l = LB[s]; l < (s === 28 ? 259 : LB[s + 1]); l++) LS[l] = 257 + s;
-for (let s = 0; s < 30; s++) for (let d = DB[s]; d < (s === 29 ? 32769 : DB[s + 1]); d++) DS[d] = s;
-const CAND = [];
-for (let L = 3; L <= 258; L++) { const t = new Set(); for (let l = 3; l <= Math.min(L, 10); l++) t.add(l); for (const b of LB) if (b <= L && b > 10) t.add(b); t.add(L); CAND[L] = [...t].sort((a, b) => a - b); }
-const CLO = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
-// Length-limited Huffman (package-merge), maxBits 15 (7 for code-length code).
-function ll(freq, maxBits) {
-  const n = freq.length, len = new Int32Array(n), syms = [];
-  for (let i = 0; i < n; i++) if (freq[i] > 0) syms.push(i);
-  const m = syms.length;
-  if (m === 0) return len;
-  if (m === 1) { len[syms[0]] = 1; return len; }
-  let cur = syms.map(s => ({ w: freq[s], s: [s] })).sort((a, b) => a.w - b.w);
-  const first = cur;
-  for (let lvl = 1; lvl < maxBits; lvl++) {
-    const pkg = [];
-    for (let k = 0; k + 1 < cur.length; k += 2) pkg.push({ w: cur[k].w + cur[k + 1].w, s: cur[k].s.concat(cur[k + 1].s) });
-    if (cur.length % 2 === 1) pkg.push(cur[cur.length - 1]);
-    const mg = []; let i = 0, j = 0;
-    while (i < pkg.length && j < first.length) { if (pkg[i].w <= first[j].w) mg.push(pkg[i++]); else mg.push(first[j++]); }
-    while (i < pkg.length) mg.push(pkg[i++]);
-    while (j < first.length) mg.push(first[j++]);
-    cur = mg;
+// deflate.mjs — a from-scratch optimal-parse DEFLATE encoder (RFC 1951) plus the
+// small helpers the PNG writer needs. Pure Node standard library, no clock, no
+// randomness, no I/O: the same input bytes always produce the same output bytes.
+//
+// The encoder works in three passes over the input:
+//   1. a hash-chain walk finds, at every position, the longest match and the
+//      closest match (smallest distance with length >= 3). The result is cached,
+//      so later passes never walk a chain again;
+//   2. a dynamic-programming parse picks literals and matches by true bit cost,
+//      using a cost model (Huffman bit lengths) that is refined over a few
+//      iterations from the previous parse's symbol frequencies;
+//   3. the best parse seen is written as one block, dynamic or fixed Huffman,
+//      whichever is smaller in bytes, and wrapped in a zlib stream.
+//
+// Length and distance code tables are the fixed tables of the DEFLATE format.
+
+// Length codes 257..285: base length and extra bits for each.
+const LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+const LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+// Distance codes 0..29: base distance and extra bits for each.
+const DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+const DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+// The order the dynamic header writes the code-length code's lengths in.
+const CL_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+// Fixed Huffman bit lengths (RFC 1951 section 3.2.6).
+const FIXED_LIT_LEN = new Uint8Array(288);
+for (let s = 0; s < 144; s++) FIXED_LIT_LEN[s] = 8;
+for (let s = 144; s < 256; s++) FIXED_LIT_LEN[s] = 9;
+for (let s = 256; s < 280; s++) FIXED_LIT_LEN[s] = 7;
+for (let s = 280; s < 288; s++) FIXED_LIT_LEN[s] = 8;
+const FIXED_DIST_LEN = new Uint8Array(32).fill(5);
+
+// Lookup: match length (3..258) -> length symbol, and the extra-bits value/count.
+// (16-bit: length symbols run 257..285, past a byte's range.)
+const LEN_SYM = new Uint16Array(259);
+const LEN_EXT_VAL = new Uint8Array(259);
+const LEN_EXT_BITS = new Uint8Array(259);
+for (let k = 0; k < 29; k++) {
+  for (let v = 0; v < (1 << LEN_EXTRA[k]); v++) {
+    const len = LEN_BASE[k] + v;
+    if (len < 259) { LEN_SYM[len] = 257 + k; LEN_EXT_VAL[len] = v; LEN_EXT_BITS[len] = LEN_EXTRA[k]; }
   }
-  const take = 2 * m - 2;
-  for (let i = 0; i < take && i < cur.length; i++) for (const s of cur[i].s) len[s]++;
-  return len;
 }
-function canon(lengths) {
-  const n = lengths.length, codes = new Int32Array(n);
-  let mx = 0; for (let i = 0; i < n; i++) if (lengths[i] > mx) mx = lengths[i];
-  const bc = new Int32Array(mx + 1);
-  for (let i = 0; i < n; i++) if (lengths[i] > 0) bc[lengths[i]]++;
-  const nc = new Int32Array(mx + 1); let c = 0;
-  for (let b = 1; b <= mx; b++) { c = (c + bc[b - 1]) << 1; nc[b] = c; }
-  for (let i = 0; i < n; i++) if (lengths[i] > 0) codes[i] = nc[lengths[i]]++;
-  return { codes, mx };
+LEN_SYM[258] = 285; LEN_EXT_VAL[258] = 0; LEN_EXT_BITS[258] = 0;
+// Lookup: distance (1..32768) -> distance symbol, extra-bits value/count.
+const DIST_SYM = new Uint8Array(32769);
+const DIST_EXT_VAL = new Uint16Array(32769);
+const DIST_EXT_BITS = new Uint8Array(32769);
+for (let k = 0; k < 30; k++) {
+  for (let v = 0; v < (1 << DIST_EXTRA[k]); v++) {
+    const d = DIST_BASE[k] + v;
+    if (d <= 32768) { DIST_SYM[d] = k; DIST_EXT_VAL[d] = v; DIST_EXT_BITS[d] = DIST_EXTRA[k]; }
+  }
 }
-function costsFromLengths(litLen, distLen) {
-  const litCost = new Float64Array(256);
-  for (let b = 0; b < 256; b++) litCost[b] = litLen[b];
+
+/** Adler-32 of bytes (zlib's checksum), as an unsigned 32-bit number. */
+export function adler32(bytes) {
+  let a = 1, b = 0;
+  for (let i = 0; i < bytes.length;) {
+    const end = Math.min(bytes.length, i + 5552);
+    for (; i < end; i++) { a += bytes[i]; b += a; }
+    a %= 65521; b %= 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+/** Reverse the low `len` bits of `code` (DEFLATE writes Huffman codes starting with their most significant bit). */
+function reverseBits(code, len) {
+  let r = 0;
+  for (let i = 0; i < len; i++) { r = (r << 1) | (code & 1); code >>>= 1; }
+  return r;
+}
+
+/** A bit writer: bits go out least-significant-bit first within each byte. */
+class BitWriter {
+  constructor(capacity) {
+    this.buf = new Uint8Array(capacity);
+    this.pos = 0;
+    this.bitBuf = 0;
+    this.bitCnt = 0;
+  }
+  writeBits(value, count) {
+    if (count === 0) return;
+    this.bitBuf |= (value & ((1 << count) - 1)) << this.bitCnt;
+    this.bitCnt += count;
+    while (this.bitCnt >= 8) {
+      this.buf[this.pos++] = this.bitBuf & 0xff;
+      this.bitBuf >>>= 8;
+      this.bitCnt -= 8;
+    }
+  }
+  /** Write a Huffman code of `len` bits, most significant bit first. */
+  writeCode(reversedCode, len) { this.writeBits(reversedCode, len); }
+  align() {
+    if (this.bitCnt > 0) { this.buf[this.pos++] = this.bitBuf & 0xff; this.bitBuf = 0; this.bitCnt = 0; }
+  }
+  bytes() { return this.buf.subarray(0, this.pos); }
+}
+
+/**
+ * Canonical Huffman codes from bit lengths: returns { codes, rev } where codes[s]
+ * is the code value and rev[s] is the same code with its bits reversed, ready for
+ * the bit writer. Lengths of 0 mean the symbol is unused.
+ */
+function canonicalCodes(lengths) {
+  const n = lengths.length;
+  let maxLen = 0;
+  for (let s = 0; s < n; s++) if (lengths[s] > maxLen) maxLen = lengths[s];
+  const blCount = new Int32Array(maxLen + 1);
+  for (let s = 0; s < n; s++) if (lengths[s] > 0) blCount[lengths[s]]++;
+  const nextCode = new Int32Array(maxLen + 1);
+  let code = 0;
+  for (let bits = 1; bits <= maxLen; bits++) { code = (code + blCount[bits - 1]) << 1; nextCode[bits] = code; }
+  const codes = new Int32Array(n);
+  const rev = new Int32Array(n);
+  for (let s = 0; s < n; s++) {
+    const l = lengths[s];
+    if (l > 0) { codes[s] = nextCode[l]; nextCode[l]++; rev[s] = reverseBits(codes[s], l); }
+  }
+  return { codes, rev, maxLen };
+}
+
+/**
+ * Length-limited Huffman code lengths by package-merge (Moffat-Turpin): the
+ * optimal code with every length at most `maxBits`, for the given symbol
+ * frequencies. `freq` is an array of counts; the result is a Uint8Array of the
+ * same length, 0 for symbols with count 0. Deterministic: ties break by symbol.
+ *
+ * How it works: the symbols are sorted by weight; list 0 holds one item per
+ * symbol. Each later list is made by packaging the previous list (pairing
+ * adjacent items, summing weights, joining their symbol sets; a leftover odd
+ * item is dropped) and merging the packages back with list 0. After maxBits-1
+ * rounds, a symbol's code length is the number of items in the final list
+ * whose symbol set holds it.
+ */
+export function huffmanLengths(freq, maxBits) {
+  const n = freq.length;
+  const lengths = new Uint8Array(n);
+  const syms = [];
+  for (let s = 0; s < n; s++) if (freq[s] > 0) syms.push(s);
+  if (syms.length === 0) return lengths;
+  if (syms.length === 1) { lengths[syms[0]] = 1; return lengths; }
+  // Sort symbols by frequency, then by symbol, so every tie is settled the same way.
+  syms.sort((a, b) => (freq[a] - freq[b]) || (a - b));
+  // One list, each item { w, set } with set the symbols the item covers. Every
+  // list is kept to its smallest 2n-2 items, which is what makes the final
+  // list's counts the code lengths.
+  const keep = 2 * syms.length - 2;
+  let list = syms.map((s) => ({ w: freq[s], set: [s] }));
+  const byWeight = (x, y) => (x.w - y.w) || (x.set[0] - y.set[0]);
+  for (let round = 1; round < maxBits; round++) {
+    // Package: pair adjacent items of the previous list.
+    const packed = [];
+    for (let i = 0; i + 1 < list.length; i += 2) {
+      packed.push({ w: list[i].w + list[i + 1].w, set: list[i].set.concat(list[i + 1].set) });
+    }
+    if (packed.length === 0) break;
+    // Merge the packages with list 0 (the singletons), keeping weight order.
+    const singles = syms.map((s) => ({ w: freq[s], set: [s] }));
+    const merged = [];
+    let a = 0, b = 0;
+    while (a < packed.length && b < singles.length) {
+      if (byWeight(packed[a], singles[b]) <= 0) merged.push(packed[a++]);
+      else merged.push(singles[b++]);
+    }
+    while (a < packed.length) merged.push(packed[a++]);
+    while (b < singles.length) merged.push(singles[b++]);
+    list = merged.length > keep ? merged.slice(0, keep) : merged;
+    if (list.length <= 2) break;
+  }
+  for (const item of list) for (const s of item.set) lengths[s]++;
+  return lengths;
+}
+
+/** Cost model from bit lengths: a symbol's cost is its length, or 15 bits when unused (never free, never infinite). */
+function costFromLengths(lengths, fallback) {
+  const cost = new Float64Array(lengths.length);
+  for (let s = 0; s < lengths.length; s++) cost[s] = lengths[s] > 0 ? lengths[s] : fallback;
+  return cost;
+}
+
+/**
+ * Hash-chain match search over the whole stream, once. For every position it
+ * records the longest match (length, distance) and the closest match (the
+ * smallest distance whose length is at least 3). The chains hold the most
+ * recent position first, so the first candidate with a real length is the
+ * closest match. Candidates are rejected cheaply: a candidate can only beat
+ * the best length found so far when its byte at that length matches, so most
+ * chain steps cost a single comparison. A match that reaches the longest
+ * possible length stops the walk at once, and a good match shortens the
+ * remaining walk, which is what keeps long runs of equal bytes cheap.
+ *
+ * `chainCap` bounds the walk at each position; `niceLen` (default 258) is the
+ * length at which the walk stops early.
+ */
+export function findMatches(data, chainCap, niceLen = 258) {
+  const n = data.length;
+  const head = new Int32Array(32768).fill(-1);
+  const prev = new Int32Array(n);
+  const longLen = new Uint16Array(n);
+  const longDist = new Uint16Array(n);
+  const closeLen = new Uint16Array(n);
+  const closeDist = new Uint16Array(n);
+  // The Pareto frontier of (length, distance) at each position: every time the
+  // walk finds a longer match than any nearer candidate, that (length,
+  // distance) is a frontier point — a shorter match at a nearer distance can
+  // be cheaper than the longest match at a far one. Up to four points, kept
+  // in walk order (increasing distance and length); the first is the closest
+  // match and the last the longest, so the middle points are the useful new
+  // ones. Recording them is free: they are exactly the candidates whose full
+  // length the walk already measures.
+  const NF = 4;
+  const fLen = new Uint16Array(n * NF);
+  const fDist = new Uint16Array(n * NF);
+  const last = n - 3; // positions past this hold no 3-byte hash
+  for (let pos = 0; pos <= last; pos++) {
+    const h = ((data[pos] << 10) ^ (data[pos + 1] << 5) ^ data[pos + 2]) & 0x7fff;
+    let cand = head[h];
+    const maxLen = Math.min(258, n - pos);
+    let bestLen = 2;
+    let bestDist = 0;
+    let cLen = 0;
+    let cDist = 0;
+    let fCount = 0;
+    let tries = 0;
+    let limit = chainCap;
+    while (cand >= 0 && pos - cand <= 32768 && tries < limit) {
+      tries++;
+      const dist = pos - cand;
+      // A candidate is only measured when it can beat the longest match, and
+      // the closest match still needs its true length even when it cannot.
+      if ((bestLen < maxLen && data[cand + bestLen] === data[pos + bestLen]) || cLen === 0) {
+        let len = 0;
+        while (len < maxLen && data[pos + len] === data[cand + len]) len++;
+        if (len >= 3 && cLen === 0) { cLen = len; cDist = dist; }
+        if (len > bestLen) {
+          bestLen = len;
+          bestDist = dist;
+          // A new record: a frontier point.
+          if (fCount < NF) {
+            fLen[pos * NF + fCount] = len;
+            fDist[pos * NF + fCount] = dist;
+            fCount++;
+          } else {
+            // Keep the closest point and the three most recent records.
+            fLen[pos * NF + 1] = fLen[pos * NF + 2];
+            fDist[pos * NF + 1] = fDist[pos * NF + 2];
+            fLen[pos * NF + 2] = fLen[pos * NF + 3];
+            fDist[pos * NF + 2] = fDist[pos * NF + 3];
+            fLen[pos * NF + 3] = len;
+            fDist[pos * NF + 3] = dist;
+          }
+          if (len >= niceLen || len >= maxLen) break;
+          if (len >= 32) limit = Math.min(limit, tries + 16);
+        }
+      }
+      cand = prev[cand];
+    }
+    if (bestLen >= 3) { longLen[pos] = bestLen; longDist[pos] = bestDist; }
+    if (cLen >= 3) { closeLen[pos] = cLen; closeDist[pos] = cDist; }
+    // Insert this position for later positions to find.
+    prev[pos] = head[h];
+    head[h] = pos;
+  }
+  // nextGood[i]: the smallest j >= i whose longest match is at least GOOD
+  // bytes, or -1; prevGood[i]: the largest j <= i with that property, or -1.
+  // The parse uses them to end a match where a good match starts.
+  const GOOD = 8;
+  const nextGood = new Int32Array(n + 2).fill(-1);
+  for (let i = n - 1; i >= 0; i--) nextGood[i] = longLen[i] >= GOOD ? i : nextGood[i + 1];
+  const prevGood = new Int32Array(n + 2).fill(-1);
+  for (let i = 0; i < n; i++) prevGood[i] = longLen[i] >= GOOD ? i : (i > 0 ? prevGood[i - 1] : -1);
+  return { longLen, longDist, closeLen, closeDist, nextGood, prevGood, fLen, fDist, NF };
+}
+
+/**
+ * The cost model for one dynamic-programming pass: the bit cost of every match
+ * length and every distance, from the current literal/length and distance bit
+ * lengths. `lenCost[l]` is the cost of the length symbol for length l plus its
+ * extra bits; `distCost[d]` the same for distance d.
+ */
+function buildMatchCosts(litCost, distCost) {
   const lenCost = new Float64Array(259);
-  for (let l = 3; l <= 258; l++) lenCost[l] = litLen[LS[l]] + LE[LS[l] - 257];
-  const distCost = new Float64Array(32769);
-  for (let d = 1; d <= 32768; d++) distCost[d] = distLen[DS[d]] + DE[DS[d]];
-  return { litCost, lenCost, distCost };
+  for (let l = 3; l <= 258; l++) lenCost[l] = litCost[LEN_SYM[l]] + LEN_EXT_BITS[l];
+  const distCostArr = new Float64Array(32769);
+  for (let d = 1; d <= 32768; d++) distCostArr[d] = distCost[DIST_SYM[d]] + DIST_EXT_BITS[d];
+  return { lenCost, distCost: distCostArr };
 }
-function fixedCosts() {
-  const litLen = new Int32Array(288);
-  for (let i = 0; i < 144; i++) litLen[i] = 8;
-  for (let i = 144; i < 256; i++) litLen[i] = 9;
-  for (let i = 256; i < 280; i++) litLen[i] = 7;
-  for (let i = 280; i < 288; i++) litLen[i] = 8;
-  return costsFromLengths(litLen, new Int32Array(30).fill(5));
+
+/**
+ * The dynamic-programming parse: the cheapest way to encode `data` with the
+ * given cost model, walking every position (including positions inside a long
+ * match, so a match can start there). From each position the transitions are
+ * the literal, the longest match (at its full length and the two lengths below
+ * it, same distance) and the closest match (at its length and the one below
+ * it, when its distance differs). Symbols are stored as two parallel arrays:
+ * `symLen` (1 for a literal, otherwise the match length) and `symVal` (the
+ * literal byte, or the match distance). Returns the symbols, their
+ * frequencies, and the parse's bit cost under this model, without the
+ * end-of-block symbol.
+ */
+export function optimalParse(data, m, litCost, distCost, mode = 'short') {
+  const n = data.length;
+  const { lenCost, distCost: distPart } = buildMatchCosts(litCost, distCost);
+  const cost = new Float64Array(n + 1);
+  cost.fill(Infinity);
+  cost[0] = 0;
+  const choiceLen = new Uint16Array(n + 1);
+  const choiceDist = new Uint16Array(n + 1);
+  const { longLen, longDist, closeLen, closeDist, nextGood, prevGood, fLen, fDist, NF } = m;
+  for (let i = 0; i < n; i++) {
+    const ci = cost[i];
+    if (ci === Infinity) continue;
+    const litC = ci + litCost[data[i]];
+    if (litC < cost[i + 1]) { cost[i + 1] = litC; choiceLen[i + 1] = 1; choiceDist[i + 1] = 0; }
+    const L = longLen[i];
+    if (L >= 3) {
+      const D = longDist[i];
+      const base = ci + distPart[D];
+      const low = mode === 'all' ? 3 : (L - 2 < 3 ? 3 : L - 2);
+      for (let l = L; l >= low; l--) {
+        const c = base + lenCost[l];
+        const j = i + l;
+        if (c < cost[j]) { cost[j] = c; choiceLen[j] = l; choiceDist[j] = D; }
+      }
+      if (mode === 'good') {
+        // Lengths ending where a good match starts, so the next match can
+        // begin there: the first few good starts after this match begins, and
+        // the last few before it ends. Bounded, so a long run of good starts
+        // does not turn this into the all-lengths walk.
+        const end = i + L;
+        let j = nextGood[i + 3];
+        for (let k = 0; k < 4 && j !== -1 && j <= end; k++) {
+          const l = j - i;
+          if (l < L - 2 && l >= 3) {
+            const c = base + lenCost[l];
+            if (c < cost[j]) { cost[j] = c; choiceLen[j] = l; choiceDist[j] = D; }
+          }
+          j = nextGood[j + 1];
+        }
+        j = prevGood[end];
+        for (let k = 0; k < 4 && j !== -1 && j > i + 2; k++) {
+          const l = j - i;
+          if (l < L - 2 && l >= 3) {
+            const c = base + lenCost[l];
+            if (c < cost[j]) { cost[j] = c; choiceLen[j] = l; choiceDist[j] = D; }
+          }
+          j = prevGood[j - 1];
+        }
+      }
+    }
+    const Cl = closeLen[i];
+    const Cd = closeDist[i];
+    if (Cl >= 3 && Cd !== longDist[i]) {
+      const base = ci + distPart[Cd];
+      const low = mode === 'all' ? 3 : (Cl - 1 < 3 ? 3 : Cl - 1);
+      for (let l = Cl; l >= low; l--) {
+        const c = base + lenCost[l];
+        const j = i + l;
+        if (c < cost[j]) { cost[j] = c; choiceLen[j] = l; choiceDist[j] = Cd; }
+      }
+    }
+    // The Pareto frontier: a shorter match at a nearer distance can be
+    // cheaper than the longest match at a far one. Full length only, so this
+    // adds a few transitions per position.
+    const fi = i * NF;
+    for (let f = 0; f < NF; f++) {
+      const fl = fLen[fi + f];
+      const fd = fDist[fi + f];
+      if (fl >= 3 && fd !== longDist[i] && fd !== Cd) {
+        const c = ci + distPart[fd] + lenCost[fl];
+        const j = i + fl;
+        if (c < cost[j]) { cost[j] = c; choiceLen[j] = fl; choiceDist[j] = fd; }
+      }
+    }
+  }
+  // Backtrack from the end, filling the symbol lists in order.
+  let count = 0;
+  for (let j = n; j > 0;) { count++; j -= choiceLen[j]; }
+  const symLen = new Uint16Array(count);
+  const symVal = new Uint16Array(count);
+  let k = count;
+  for (let j = n; j > 0;) {
+    const l = choiceLen[j];
+    k--;
+    symLen[k] = l;
+    symVal[k] = l === 1 ? data[j - 1] : choiceDist[j];
+    j -= l;
+  }
+  const freqLit = new Int32Array(288);
+  const freqDist = new Int32Array(32);
+  for (let s = 0; s < count; s++) {
+    const l = symLen[s];
+    if (l === 1) freqLit[symVal[s]]++;
+    else { freqLit[LEN_SYM[l]]++; freqDist[DIST_SYM[symVal[s]]]++; }
+  }
+  freqLit[256]++; // end of block
+  return { symLen, symVal, count, freqLit, freqDist, bits: cost[n] + litCost[256] };
 }
-class BW {
-  constructor() { this.bytes = []; this.acc = 0; this.nbits = 0; }
-  put(code, len) { this.acc |= code << this.nbits; this.nbits += len; while (this.nbits >= 8) { this.bytes.push(this.acc & 0xff); this.acc >>>= 8; this.nbits -= 8; } }
-  putRev(code, len) { let r = 0; for (let i = 0; i < len; i++) r = (r << 1) | ((code >> i) & 1); this.put(r, len); }
-  flush() { if (this.nbits > 0) { this.bytes.push(this.acc & 0xff); this.acc = 0; this.nbits = 0; } }
-  result() { return new Uint8Array(this.bytes); }
-}
-function rleLengths(litLen, distLen) {
-  let hlit = litLen.length;
-  while (hlit > 257 && litLen[hlit - 1] === 0) hlit--;
-  let hdist = distLen.length;
-  while (hdist > 1 && distLen[hdist - 1] === 0) hdist--;
-  const all = [];
-  for (let i = 0; i < hlit; i++) all.push(litLen[i]);
-  for (let i = 0; i < hdist; i++) all.push(distLen[i]);
-  const end = all.length, seq = [];
+
+/**
+ * The RLE of the literal/length and distance bit lengths for a dynamic block
+ * header. Returns the trimmed counts (hlit literal lengths, hdist distance
+ * lengths), the RLE entries as [symbol, extra value, extra bit count] triples,
+ * and the frequencies of the code-length symbols the entries use.
+ */
+function rleLengths(litLengths, distLengths) {
+  let hlit = 287;
+  while (hlit > 257 && litLengths[hlit - 1] === 0) hlit--;
+  let hdist = 30;
+  while (hdist > 1 && distLengths[hdist - 1] === 0) hdist--;
+  const lens = new Uint8Array(hlit + hdist);
+  lens.set(litLengths.subarray(0, hlit));
+  lens.set(distLengths.subarray(0, hdist), hlit);
+  const entries = [];
+  const freq = new Int32Array(19);
   let i = 0;
-  while (i < end) {
-    const v = all[i]; let run = 1;
-    while (i + run < end && all[i + run] === v) run++;
+  while (i < lens.length) {
+    const v = lens[i];
+    let run = 1;
+    while (i + run < lens.length && lens[i + run] === v) run++;
     if (v === 0) {
       let r = run;
-      while (r >= 11) { const t = Math.min(r, 138); seq.push([18, t - 11]); r -= t; }
-      if (r >= 3) { seq.push([17, r - 3]); r = 0; }
-      while (r > 0) { seq.push([0, 0]); r--; }
+      while (r >= 11) { const take = Math.min(r, 138); entries.push([18, take - 11, 7]); freq[18]++; r -= take; }
+      if (r >= 3) { entries.push([17, r - 3, 3]); freq[17]++; r = 0; }
+      while (r > 0) { entries.push([0, 0, 0]); freq[0]++; r--; }
     } else {
-      seq.push([v, 0]);
+      entries.push([v, 0, 0]); freq[v]++;
       let r = run - 1;
-      while (r >= 3) { const t = Math.min(r, 6); seq.push([16, t - 3]); r -= t; }
-      while (r > 0) { seq.push([v, 0]); r--; }
+      while (r >= 3) { const take = Math.min(r, 6); entries.push([16, take - 3, 2]); freq[16]++; r -= take; }
+      while (r > 0) { entries.push([v, 0, 0]); freq[v]++; r--; }
     }
     i += run;
   }
-  return { seq, hlit, hdist };
+  return { hlit, hdist, entries, freq };
 }
-function headerBits(litLen, distLen) {
-  const { seq, hlit, hdist } = rleLengths(litLen, distLen);
-  const cf = new Int32Array(19);
-  for (const [s] of seq) cf[s]++;
-  const clLen = ll(cf, 7);
-  let nCl = 19;
-  while (nCl > 4 && clLen[CLO[nCl - 1]] === 0) nCl--;
-  let bits = 5 + 5 + 4 + 3 * nCl;
-  for (const [s] of seq) { bits += clLen[s]; if (s === 16) bits += 2; else if (s === 17) bits += 3; else if (s === 18) bits += 7; }
-  return { bits, seq, hlit, hdist, clLen, nCl };
-}
-function emitDynHeader(w, litLen, distLen) {
-  const { seq, hlit, hdist, clLen, nCl } = headerBits(litLen, distLen);
-  const { codes: clCodes } = canon(clLen);
-  w.put(hlit - 257, 5); w.put(hdist - 1, 5); w.put(nCl - 4, 4);
-  for (let i = 0; i < nCl; i++) w.put(clLen[CLO[i]], 3);
-  for (const [s, e] of seq) {
-    w.putRev(clCodes[s], clLen[s]);
-    if (s === 16) w.put(e, 2); else if (s === 17) w.put(e, 3); else if (s === 18) w.put(e, 7);
+
+/**
+ * The exact bit size of one dynamic block and of one fixed block holding
+ * `parse` with the given bit lengths, plus everything the emitter needs for
+ * the dynamic header. The dynamic size includes the whole header.
+ */
+function blockSizes(parse, litLengths, distLengths) {
+  const { symLen, symVal, count } = parse;
+  const rle = rleLengths(litLengths, distLengths);
+  let clLengths = huffmanLengths(rle.freq, 7);
+  // The code-length code needs at least two symbols to be a complete code.
+  let used = 0;
+  for (let s = 0; s < 19; s++) if (clLengths[s] > 0) used++;
+  if (used === 1) {
+    for (const s of CL_ORDER) {
+      if (clLengths[s] === 0) { clLengths[s] = 1; break; }
+    }
   }
-}
-// Lazy match search; records the best match at each visited position.
-function lazyParse(data, chainCap, recLen, recDist, nice = 128, interior = null) {
-  const n = data.length;
-  const head = new Int32Array(32768).fill(-1), prev = new Int32Array(n);
-  const hashAt = (i) => (Math.imul((data[i] << 16) | (data[i + 1] << 8) | data[i + 2], 2654435761) >>> 17) & 32767;
-  const insert = (i) => { if (i + 2 < n) { const h = hashAt(i); prev[i] = head[h]; head[h] = i; } };
-  // Chain search at an arbitrary position (hash table already complete there).
-  const searchIn = (pos, cap) => {
-    const maxLen = Math.min(258, n - pos);
-    if (maxLen < 3) return [0, 0];
-    const h = hashAt(pos);
-    let cand = head[h], bestLen = 2, bestDist = 0, chain = 0;
-    while (cand >= 0 && chain < cap) {
-      const dist = pos - cand;
-      if (dist < 1) { cand = prev[cand]; chain++; continue; }
-      if (dist > 32768) break;
-      if (data[cand + bestLen] === data[pos + bestLen]) {
-        let l = 0;
-        while (l < maxLen && data[cand + l] === data[pos + l]) l++;
-        if (l > bestLen) { bestLen = l; bestDist = dist; if (l === maxLen) break; }
-      }
-      cand = prev[cand]; chain++;
-    }
-    return bestLen >= 3 ? [bestLen, bestDist] : [0, 0];
-  };
-  const search = (pos) => {
-    const maxLen = Math.min(258, n - pos);
-    if (maxLen < 3) return [0, 0];
-    const h = hashAt(pos);
-    let cand = head[h], bestLen = 2, bestDist = 0, chain = 0, cap = chainCap;
-    while (cand >= 0 && chain < cap) {
-      const dist = pos - cand;
-      if (dist < 1) { cand = prev[cand]; chain++; continue; }
-      if (dist > 32768) break;
-      if (data[cand + bestLen] === data[pos + bestLen]) {
-        let l = 0;
-        while (l < maxLen && data[cand + l] === data[pos + l]) l++;
-        if (l > bestLen) {
-          bestLen = l; bestDist = dist;
-          if (l >= nice) break;
-          if (l >= 32) cap = Math.max(4, chainCap >> 2);
-          if (l === maxLen) break;
-        }
-      }
-      cand = prev[cand]; chain++;
-    }
-    return bestLen >= 3 ? [bestLen, bestDist] : [0, 0];
-  };
-  const tLen = [], tVal = [];
-  let pos = 0, prevLen = 0, prevDist = 0, avail = false;
-  while (pos < n) {
-    let curLen = 0, curDist = 0;
-    if (pos + 3 <= n) { const r = search(pos); curLen = r[0]; curDist = r[1]; }
-    recLen[pos] = curLen; recDist[pos] = curDist;
-    if (avail) {
-      if (curLen <= prevLen) {
-        tLen.push(prevLen); tVal.push(prevDist);
-        const s0 = pos - 1, L0 = prevLen;
-        const np = pos - 1 + prevLen;
-        for (let k = pos; k < np; k++) insert(k);
-        // Interior search: the DP can also start a match inside this match
-        // (e.g. the row-above match); record the best match at interior
-        // positions so the DP can use them.
-        if (interior && L0 >= interior.minLen) {
-          const end = Math.min(np - 1, s0 + interior.span);
-          for (let q = s0 + 1; q <= end; q++) {
-            const r = searchIn(q, interior.chain);
-            if (r[0] >= 3 && (r[0] > recLen[q] || (r[0] === recLen[q] && r[1] < recDist[q]))) { recLen[q] = r[0]; recDist[q] = r[1]; }
-          }
-        }
-        pos = np; avail = false; prevLen = 0; continue;
-      }
-      tLen.push(0); tVal.push(data[pos - 1]);
-      prevLen = curLen; prevDist = curDist; insert(pos); pos++;
+  let hclen = 4;
+  for (let k = 4; k < 19; k++) if (clLengths[CL_ORDER[k]] > 0) hclen = k + 1;
+  let dynBits = 3 + 5 + 5 + 4 + hclen * 3;
+  for (const [sym, , extraBits] of rle.entries) dynBits += clLengths[sym] + extraBits;
+  let fixedBits = 3;
+  for (let s = 0; s < count; s++) {
+    const l = symLen[s];
+    if (l === 1) {
+      dynBits += litLengths[symVal[s]];
+      fixedBits += FIXED_LIT_LEN[symVal[s]];
     } else {
-      if (curLen >= 3) { avail = true; prevLen = curLen; prevDist = curDist; insert(pos); pos++; }
-      else { tLen.push(0); tVal.push(data[pos]); insert(pos); pos++; }
+      dynBits += litLengths[LEN_SYM[l]] + LEN_EXT_BITS[l] + distLengths[DIST_SYM[symVal[s]]] + DIST_EXT_BITS[symVal[s]];
+      fixedBits += FIXED_LIT_LEN[LEN_SYM[l]] + LEN_EXT_BITS[l] + 5 + DIST_EXT_BITS[symVal[s]];
     }
   }
-  if (avail) { tLen.push(prevLen); tVal.push(prevDist); }
-  return { tLen, tVal };
+  dynBits += litLengths[256];
+  fixedBits += FIXED_LIT_LEN[256];
+  return { dynBits, fixedBits, dynBytes: (dynBits + 7) >> 3, fixedBytes: (fixedBits + 7) >> 3, rle, clLengths, hclen };
 }
-// DP optimal parse over the recorded matches (true bit costs).
-function dpParse(data, recLen, recDist, costs) {
-  const n = data.length, { litCost, lenCost, distCost } = costs;
-  const cost = new Float64Array(n + 1).fill(Infinity), prev = new Int32Array(n + 1);
-  const tlen = new Uint16Array(n + 1), tdist = new Uint16Array(n + 1);
-  cost[0] = 0;
-  for (let i = 0; i < n; i++) {
-    const c = cost[i], nc = c + litCost[data[i]];
-    if (nc < cost[i + 1]) { cost[i + 1] = nc; prev[i + 1] = i; tlen[i + 1] = 0; }
-    const L = recLen[i];
-    if (L >= 3) {
-      const dc = distCost[recDist[i]], cands = CAND[L];
-      for (let k = 0; k < cands.length; k++) {
-        const l = cands[k], j = i + l, nc2 = c + dc + lenCost[l];
-        if (nc2 < cost[j]) { cost[j] = nc2; prev[j] = i; tlen[j] = l; tdist[j] = recDist[i]; }
+
+/** Write one block (dynamic or fixed) holding `parse` into the bit writer.
+ * `final` marks the last block of the DEFLATE stream; only the last block is
+ * byte-aligned, since blocks are bit-packed back to back. */
+function emitBlock(w, parse, litLengths, distLengths, sizes, dynamic, final) {
+  const { symLen, symVal, count } = parse;
+  if (dynamic) {
+    const litCodes = canonicalCodes(litLengths);
+    const distCodes = canonicalCodes(distLengths);
+    const clCodes = canonicalCodes(sizes.clLengths);
+    const { hlit, hdist, entries } = sizes.rle;
+    w.writeBits(final ? 1 : 0, 1);
+    w.writeBits(2, 2); // BTYPE 10, dynamic
+    w.writeBits(hlit - 257, 5);
+    w.writeBits(hdist - 1, 5);
+    w.writeBits(sizes.hclen - 4, 4);
+    for (let k = 0; k < sizes.hclen; k++) w.writeBits(sizes.clLengths[CL_ORDER[k]], 3);
+    for (const [sym, extra, extraBits] of entries) {
+      w.writeCode(clCodes.rev[sym], sizes.clLengths[sym]);
+      if (extraBits > 0) w.writeBits(extra, extraBits);
+    }
+    for (let s = 0; s < count; s++) {
+      const l = symLen[s];
+      if (l === 1) {
+        w.writeCode(litCodes.rev[symVal[s]], litLengths[symVal[s]]);
+      } else {
+        w.writeCode(litCodes.rev[LEN_SYM[l]], litLengths[LEN_SYM[l]]);
+        if (LEN_EXT_BITS[l] > 0) w.writeBits(LEN_EXT_VAL[l], LEN_EXT_BITS[l]);
+        w.writeCode(distCodes.rev[DIST_SYM[symVal[s]]], distLengths[DIST_SYM[symVal[s]]]);
+        if (DIST_EXT_BITS[symVal[s]] > 0) w.writeBits(DIST_EXT_VAL[symVal[s]], DIST_EXT_BITS[symVal[s]]);
       }
     }
-  }
-  const tLen = [], tVal = [];
-  let j = n;
-  while (j > 0) { const p = prev[j], l = tlen[j]; if (l === 0) { tLen.push(0); tVal.push(data[p]); } else { tLen.push(l); tVal.push(tdist[j]); } j = p; }
-  tLen.reverse(); tVal.reverse();
-  return { tLen, tVal, bits: cost[n] };
-}
-function freqs(tLen, tVal) {
-  const lf = new Int32Array(286), df = new Int32Array(30);
-  for (let i = 0; i < tLen.length; i++) { if (tLen[i] === 0) lf[tVal[i]]++; else { lf[LS[tLen[i]]]++; df[DS[tVal[i]]]++; } }
-  lf[256]++;
-  return { lf, df };
-}
-function emitBlock(w, tLen, tVal, lo, hi, isLast) {
-  const lf = new Int32Array(286), df = new Int32Array(30);
-  for (let i = lo; i < hi; i++) { if (tLen[i] === 0) lf[tVal[i]]++; else { lf[LS[tLen[i]]]++; df[DS[tVal[i]]]++; } }
-  lf[256]++;
-  const litLen = ll(lf, 15);
-  let ndist = 30;
-  while (ndist > 1 && df[ndist - 1] === 0) ndist--;
-  const distLen = ll(df, 15).slice(0, ndist);
-  if (ndist === 1 && distLen[0] === 0) distLen[0] = 1;
-  let fixedBits = 3 + 7;
-  for (let i = lo; i < hi; i++) {
-    if (tLen[i] === 0) fixedBits += tVal[i] < 144 ? 8 : 9;
-    else fixedBits += (LS[tLen[i]] <= 279 ? 7 : 8) + LE[LS[tLen[i]] - 257] + 5 + DE[DS[tVal[i]]];
-  }
-  const hb = headerBits(litLen, distLen);
-  let dynBits = 3 + hb.bits;
-  for (let i = lo; i < hi; i++) {
-    if (tLen[i] === 0) dynBits += litLen[tVal[i]];
-    else dynBits += litLen[LS[tLen[i]]] + LE[LS[tLen[i]] - 257] + distLen[DS[tVal[i]]] + DE[DS[tVal[i]]];
-  }
-  dynBits += litLen[256];
-  if (fixedBits <= dynBits) {
-    w.put(isLast ? 1 : 0, 1); w.put(1, 2);
-    for (let i = lo; i < hi; i++) {
-      if (tLen[i] === 0) { const v = tVal[i]; w.putRev(v < 144 ? (0x30 + v) : (0x190 + (v - 144)), v < 144 ? 8 : 9); }
-      else {
-        const s = LS[tLen[i]];
-        w.putRev(s < 280 ? s - 256 : 0xC0 + (s - 280), s < 280 ? 7 : 8);
-        w.put(tLen[i] - LB[s - 257], LE[s - 257]);
-        const d = DS[tVal[i]];
-        w.putRev(d, 5);
-        w.put(tVal[i] - DB[d], DE[d]);
-      }
-    }
-    w.putRev(0, 7);
+    w.writeCode(litCodes.rev[256], litLengths[256]);
   } else {
-    w.put(isLast ? 1 : 0, 1); w.put(2, 2);
-    emitDynHeader(w, litLen, distLen);
-    const { codes: litCodes } = canon(litLen), { codes: distCodes } = canon(distLen);
-    for (let i = lo; i < hi; i++) {
-      if (tLen[i] === 0) w.putRev(litCodes[tVal[i]], litLen[tVal[i]]);
-      else {
-        const s = LS[tLen[i]];
-        w.putRev(litCodes[s], litLen[s]);
-        w.put(tLen[i] - LB[s - 257], LE[s - 257]);
-        const d = DS[tVal[i]];
-        w.putRev(distCodes[d], distLen[d]);
-        w.put(tVal[i] - DB[d], DE[d]);
+    const fixedLit = canonicalCodes(FIXED_LIT_LEN);
+    const fixedDist = canonicalCodes(FIXED_DIST_LEN);
+    w.writeBits(final ? 1 : 0, 1);
+    w.writeBits(1, 2); // BTYPE 01, fixed
+    for (let s = 0; s < count; s++) {
+      const l = symLen[s];
+      if (l === 1) {
+        w.writeCode(fixedLit.rev[symVal[s]], FIXED_LIT_LEN[symVal[s]]);
+      } else {
+        w.writeCode(fixedLit.rev[LEN_SYM[l]], FIXED_LIT_LEN[LEN_SYM[l]]);
+        if (LEN_EXT_BITS[l] > 0) w.writeBits(LEN_EXT_VAL[l], LEN_EXT_BITS[l]);
+        w.writeCode(fixedDist.rev[DIST_SYM[symVal[s]]], 5);
+        if (DIST_EXT_BITS[symVal[s]] > 0) w.writeBits(DIST_EXT_VAL[symVal[s]], DIST_EXT_BITS[symVal[s]]);
       }
     }
-    w.putRev(litCodes[256], litLen[256]);
+    w.writeCode(fixedLit.rev[256], FIXED_LIT_LEN[256]);
   }
+  if (final) w.align();
 }
-function encodeTokens(tLen, tVal) {
-  let n = 0;
-  for (let i = 0; i < tLen.length; i++) n += tLen[i] === 0 ? 1 : tLen[i];
-  const posOf = new Int32Array(tLen.length + 1);
-  for (let i = 0; i < tLen.length; i++) posOf[i + 1] = posOf[i] + (tLen[i] === 0 ? 1 : tLen[i]);
-  const blockCost = (lo, hi) => {
-    const lf = new Int32Array(286), df = new Int32Array(30);
-    for (let i = lo; i < hi; i++) { if (tLen[i] === 0) lf[tVal[i]]++; else { lf[LS[tLen[i]]]++; df[DS[tVal[i]]]++; } }
-    lf[256]++;
-    const litLen = ll(lf, 15);
-    let ndist = 30;
-    while (ndist > 1 && df[ndist - 1] === 0) ndist--;
-    const distLen = ll(df, 15).slice(0, ndist);
-    if (ndist === 1 && distLen[0] === 0) distLen[0] = 1;
-    const hb = headerBits(litLen, distLen);
-    let dyn = 3 + hb.bits;
-    for (let i = lo; i < hi; i++) {
-      if (tLen[i] === 0) dyn += litLen[tVal[i]];
-      else dyn += litLen[LS[tLen[i]]] + LE[LS[tLen[i]] - 257] + distLen[DS[tVal[i]]] + DE[DS[tVal[i]]];
-    }
-    dyn += litLen[256];
-    let fix = 3 + 7;
-    for (let i = lo; i < hi; i++) {
-      if (tLen[i] === 0) fix += tVal[i] < 144 ? 8 : 9;
-      else fix += (LS[tLen[i]] <= 279 ? 7 : 8) + LE[LS[tLen[i]] - 257] + 5 + DE[DS[tVal[i]]];
-    }
-    return Math.min(dyn, fix);
-  };
-  let bestSplit = [0, tLen.length], bestCost = blockCost(0, tLen.length);
-  for (const k of [2, 4, 8, 16, 32]) {
-    const bounds = [0];
-    for (let b = 1; b < k; b++) {
-      const target = Math.floor(n * b / k);
-      let lo = bounds[b - 1], hi = tLen.length;
-      while (lo < hi) { const mid = (lo + hi) >> 1; if (posOf[mid + 1] < target) lo = mid + 1; else hi = mid; }
-      bounds.push(lo + 1);
-    }
-    bounds.push(tLen.length);
-    let c = 0;
-    for (let b = 0; b < k; b++) c += blockCost(bounds[b], bounds[b + 1]);
-    if (c < bestCost) { bestCost = c; bestSplit = bounds; }
+
+/**
+ * The best parse of `data`: the match search runs once, then the
+ * dynamic-programming parse is refined over `iterations` cost-model rounds,
+ * keeping the parse whose emitted block (dynamic or fixed, whichever is
+ * smaller) is smallest. Returns the parse, its Huffman lengths, the block
+ * sizes and the block size in bytes.
+ */
+export function bestParse(data, { chainCap = 256, iterations = 3, mode = 'short' } = {}) {
+  const m = findMatches(data, chainCap);
+  let litCost = new Float64Array(FIXED_LIT_LEN);
+  let distCost = new Float64Array(32).fill(5);
+  let best = null;
+  for (let it = 0; it < iterations; it++) {
+    const parse = optimalParse(data, m, litCost, distCost, mode);
+    const litLengths = huffmanLengths(parse.freqLit, 15);
+    const distLengths = huffmanLengths(parse.freqDist, 15);
+    if (parse.freqDist.every((f) => f === 0)) distLengths[0] = 1; // no matches: one dummy distance code
+    const sizes = blockSizes(parse, litLengths, distLengths);
+    const bytes = Math.min(sizes.dynBytes, sizes.fixedBytes);
+    if (best === null || bytes < best.bytes) best = { parse, litLengths, distLengths, sizes, bytes };
+    litCost = costFromLengths(litLengths, 15);
+    distCost = costFromLengths(distLengths, 15);
   }
-  const w = new BW();
-  for (let b = 0; b + 1 < bestSplit.length; b++) emitBlock(w, tLen, tVal, bestSplit[b], bestSplit[b + 1], b === bestSplit.length - 2);
-  w.flush();
-  return w.result();
+  best.dynamic = best.sizes.dynBytes <= best.sizes.fixedBytes;
+  return best;
 }
-export function deflateOpt(data, opts = {}) {
+
+/** The best DEFLATE stream of `data` as a single block. */
+export function deflateBest(data, opts = {}) {
+  const best = bestParse(data, opts);
+  const w = new BitWriter(best.bytes + 16);
+  emitBlock(w, best.parse, best.litLengths, best.distLengths, best.sizes, best.dynamic, true);
+  return { raw: w.bytes(), bytes: best.bytes, dynamic: best.dynamic, litLengths: best.litLengths, distLengths: best.distLengths };
+}
+
+/**
+ * The best DEFLATE stream of `data` split into `parts` equal blocks, each
+ * with its own Huffman tree, bit-packed into one stream. A split only helps
+ * when the stream's statistics change along its length; callers choose the
+ * part count per stream.
+ */
+export function deflateBestSplit(data, parts, opts = {}) {
   const n = data.length;
-  const chainCap = opts.chain ?? (n <= 1048576 ? 128 : 64);
-  const nice = opts.nice ?? 128, dpPasses = opts.dpPasses ?? 2;
-  const recLen = new Uint16Array(n), recDist = new Uint16Array(n);
-  lazyParse(data, chainCap, recLen, recDist, nice, opts.interior ?? null);
-  let costs = fixedCosts(), toks = null;
-  for (let p = 0; p < dpPasses; p++) {
-    toks = dpParse(data, recLen, recDist, costs);
-    const { lf, df } = freqs(toks.tLen, toks.tVal);
-    const litLen = ll(lf, 15);
-    let ndist = 30;
-    while (ndist > 1 && df[ndist - 1] === 0) ndist--;
-    const distLen = new Int32Array(30), dl = ll(df, 15);
-    for (let i = 0; i < ndist; i++) distLen[i] = dl[i];
-    if (ndist === 1 && distLen[0] === 0) distLen[0] = 1;
-    costs = costsFromLengths(litLen, distLen);
+  const segs = [];
+  const chunk = Math.ceil(n / parts);
+  for (let s = 0; s < parts; s++) {
+    const start = s * chunk;
+    if (start >= n) break;
+    segs.push(data.subarray(start, Math.min(n, start + chunk)));
   }
-  toks = dpParse(data, recLen, recDist, costs);
-  return encodeTokens(toks.tLen, toks.tVal);
+  const bests = segs.map((seg) => bestParse(seg, opts));
+  const total = bests.reduce((a, b) => a + b.bytes, 0);
+  const w = new BitWriter(total + 16);
+  bests.forEach((b, i) => {
+    emitBlock(w, b.parse, b.litLengths, b.distLengths, b.sizes, b.dynamic, i === bests.length - 1);
+  });
+  const raw = w.bytes();
+  return { raw, bytes: raw.length, parts: bests.length };
 }
-export function zlibWrap(raw, data) {
-  const out = new Uint8Array(2 + raw.length + 4);
-  out[0] = 0x78; out[1] = 0x9c; out.set(raw, 2);
-  let a = 1, b = 0;
-  for (let i = 0; i < data.length;) {
-    const end = Math.min(data.length, i + 5552);
-    for (; i < end; i++) { a += data[i]; b += a; }
-    a %= 65521; b %= 65521;
-  }
-  const ad = ((b << 16) | a) >>> 0;
-  out[out.length - 4] = (ad >>> 24) & 0xff; out[out.length - 3] = (ad >>> 16) & 0xff;
-  out[out.length - 2] = (ad >>> 8) & 0xff; out[out.length - 1] = ad & 0xff;
-  return out;
+
+/** The zlib stream of `data` (header 0x78 0x9C, DEFLATE, Adler-32). */
+export function deflateZlib(data, opts = {}) {
+  const { raw, bytes, litLengths, distLengths } = deflateBest(data, opts);
+  const out = new Uint8Array(bytes + 6);
+  out[0] = 0x78;
+  out[1] = 0x9c;
+  out.set(raw, 2);
+  const adler = adler32(data);
+  out[bytes + 2] = (adler >>> 24) & 0xff;
+  out[bytes + 3] = (adler >>> 16) & 0xff;
+  out[bytes + 4] = (adler >>> 8) & 0xff;
+  out[bytes + 5] = adler & 0xff;
+  return { zlib: out, bytes: bytes + 6, litLengths, distLengths };
+}
+
+/** The zlib stream of `data`, split into `parts` DEFLATE blocks. */
+export function deflateZlibSplit(data, parts, opts = {}) {
+  const { raw, bytes } = deflateBestSplit(data, parts, opts);
+  const out = new Uint8Array(bytes + 6);
+  out[0] = 0x78;
+  out[1] = 0x9c;
+  out.set(raw, 2);
+  const adler = adler32(data);
+  out[bytes + 2] = (adler >>> 24) & 0xff;
+  out[bytes + 3] = (adler >>> 16) & 0xff;
+  out[bytes + 4] = (adler >>> 8) & 0xff;
+  out[bytes + 5] = adler & 0xff;
+  return { zlib: out, bytes: bytes + 6 };
 }

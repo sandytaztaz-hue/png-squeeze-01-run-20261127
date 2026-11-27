@@ -1,253 +1,522 @@
-// main.ts — PNG squeeze entry (png-squeeze-01-run-20261127).
-// Lossless PNG recompression: colour-form reduction, per-row filter screen
-// (incl. brute force with a 32 KiB context dictionary), optimal-parse DEFLATE.
-// Node built-ins only + ./deflate.mjs (from-scratch optimal-parse DEFLATE).
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import * as zlib from 'node:zlib';
-import { deflateOpt, zlibWrap } from './deflate.mjs';
+// main.ts — lossless PNG recompression for screenshots (make.fun png-squeeze).
+// Reads /input/<id>/image.png for each instance, writes /output/<id>/image.png.
+//
+// The pipeline, per image: decode to RGBA; pick the colour form the pixels
+// allow (palette with two orderings, grey, grey+alpha, RGB, RGB with a tRNS
+// key, RGBA); screen the forms with zlib level 6 over minimum-sum filtered
+// rows; then refine the winner: an optimal-parse DEFLATE (see deflate.mjs)
+// gives a true cost model, the per-row filters are re-chosen by that model,
+// and the parse is refined again. The smaller of the result and a zlib level 9
+// stream wins. Pure Node standard library, deterministic: fixed work budgets
+// only, no clock, no randomness, no network.
 
-// ---- CRC-32 ----
-const CT = new Int32Array(256);
-for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); CT[n] = c; }
-function crc32(b) { let c = 0xFFFFFFFF; for (let i = 0; i < b.length; i++) c = CT[(c ^ b[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
-function chunk(t, d) {
-  const o = new Uint8Array(12 + d.length), v = new DataView(o.buffer);
-  v.setUint32(0, d.length);
-  o[4] = t.charCodeAt(0); o[5] = t.charCodeAt(1); o[6] = t.charCodeAt(2); o[7] = t.charCodeAt(3);
-  o.set(d, 8); v.setUint32(8 + d.length, crc32(o.subarray(4, 8 + d.length)));
-  return o;
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { deflateSync, inflateSync } from 'node:zlib';
+import { pathToFileURL } from 'node:url';
+import { deflateZlib, deflateZlibSplit } from './deflate.mjs';
+
+const WIDTH = 1280;
+const HEIGHT = 720;
+
+const CRC_TABLE = (() => {
+  const t = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c;
+  }
+  return t;
+})();
+
+/** CRC-32 (PNG's) of bytes[start, end). */
+function crc32(bytes, start = 0, end = bytes.length) {
+  let c = -1;
+  for (let i = start; i < end; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ -1) >>> 0;
 }
 
-// ---- PNG decode (input is colour type 6, bit depth 8) ----
-function decodePng(file) {
-  const b = fs.readFileSync(file);
-  if (b[0] !== 137 || b[1] !== 80 || b[2] !== 78 || b[3] !== 71) throw new Error('not PNG');
-  let off = 8, w = 0, h = 0, ct = 0;
-  const idat = [];
-  while (off < b.length) {
-    const len = b.readUInt32BE(off), ty = b.toString('ascii', off + 4, off + 8);
-    if (ty === 'IHDR') { w = b.readUInt32BE(off + 8); h = b.readUInt32BE(off + 12); ct = b[off + 17]; }
-    else if (ty === 'IDAT') idat.push(b.subarray(off + 8, off + 8 + len));
-    else if (ty === 'IEND') break;
-    off += 12 + len;
+/** A PNG file of `chunks`, each [type, data]. */
+function pngOf(chunks) {
+  let size = 8;
+  for (const [, data] of chunks) size += 12 + data.length;
+  const out = new Uint8Array(size);
+  const view = new DataView(out.buffer);
+  out.set([137, 80, 78, 71, 13, 10, 26, 10], 0);
+  let at = 8;
+  for (const [type, data] of chunks) {
+    view.setUint32(at, data.length);
+    for (let i = 0; i < 4; i++) out[at + 4 + i] = type.charCodeAt(i);
+    out.set(data, at + 8);
+    view.setUint32(at + 8 + data.length, crc32(out, at + 4, at + 8 + data.length));
+    at += 12 + data.length;
   }
-  if (ct !== 6) throw new Error('expected colour type 6, got ' + ct);
-  const raw = zlib.inflateSync(Buffer.concat(idat));
-  const st = w * 4, px = new Uint8Array(w * h * 4), prev = new Uint8Array(st);
-  for (let y = 0; y < h; y++) {
-    const f = raw[y * (st + 1)], row = raw.subarray(y * (st + 1) + 1, (y + 1) * (st + 1));
-    const cur = px.subarray(y * st, (y + 1) * st);
-    for (let x = 0; x < st; x++) {
-      const a = x >= 4 ? cur[x - 4] : 0, up = prev[x], ul = x >= 4 ? prev[x - 4] : 0;
-      let v = row[x];
-      if (f === 1) v = (v + a) & 255;
-      else if (f === 2) v = (v + up) & 255;
-      else if (f === 3) v = (v + ((a + up) >> 1)) & 255;
-      else if (f === 4) { const p = a + up - ul, pa = Math.abs(p - a), pb = Math.abs(p - up), pc = Math.abs(p - ul); v = (v + (pa <= pb && pa <= pc ? a : (pb <= pc ? up : ul))) & 255; }
-      cur[x] = v;
-    }
-    prev.set(cur);
-  }
-  return { width: w, height: h, px };
+  return out;
 }
 
-// ---- analysis: distinct colours (cap 257), grey, opaque, single transparent key ----
-function analyse(px, n) {
-  const counts = new Map();
-  let grey = true, opaque = true, over = false;
-  for (let i = 0; i < n; i++) {
-    const r = px[i * 4], g = px[i * 4 + 1], b = px[i * 4 + 2], a = px[i * 4 + 3];
-    if (r !== g || g !== b) grey = false;
-    if (a !== 255) opaque = false;
-    if (!over) { const k = ((r * 256 + g) * 256 + b) * 256 + a; counts.set(k, (counts.get(k) || 0) + 1); if (counts.size > 256) { over = true; counts.clear(); } }
-  }
-  let key = -1;
-  if (!opaque) {
-    let k0 = -1, ok = true;
+/** IHDR's data: width, height, bit depth 8, the colour type, no interlace. */
+function ihdrOf(width, height, colourType) {
+  const d = new Uint8Array(13);
+  const v = new DataView(d.buffer);
+  v.setUint32(0, width);
+  v.setUint32(4, height);
+  d[8] = 8;
+  d[9] = colourType;
+  return d;
+}
+
+/** The Paeth predictor of PNG's filter 4. */
+function paeth(a, b, c) {
+  const p = a + b - c;
+  const pa = p > a ? p - a : a - p;
+  const pb = p > b ? p - b : b - p;
+  const pc = p > c ? p - c : c - p;
+  if (pa <= pb && pa <= pc) return a;
+  return pb <= pc ? b : c;
+}
+
+/**
+ * Row `cur` (stride samples, bpp a pixel, `prev` the row above or null)
+ * filtered by `type` into out[0, stride).
+ */
+function filterRow(type, cur, prev, bpp, out) {
+  const n = cur.length;
+  if (type === 0) { out.set(cur); return; }
+  if (type === 1) {
+    for (let i = 0; i < n; i++) out[i] = cur[i] - (i >= bpp ? cur[i - bpp] : 0);
+  } else if (type === 2) {
+    for (let i = 0; i < n; i++) out[i] = cur[i] - (prev === null ? 0 : prev[i]);
+  } else if (type === 3) {
+    for (let i = 0; i < n; i++) out[i] = cur[i] - (((i >= bpp ? cur[i - bpp] : 0) + (prev === null ? 0 : prev[i])) >> 1);
+  } else {
     for (let i = 0; i < n; i++) {
-      const a = px[i * 4 + 3];
-      if (a === 0) { const k = (px[i * 4] << 16) | (px[i * 4 + 1] << 8) | px[i * 4 + 2]; if (k0 < 0) k0 = k; else if (k0 !== k) { ok = false; break; } }
-      else if (a !== 255) { ok = false; break; }
+      const a = i >= bpp ? cur[i - bpp] : 0;
+      const b = prev === null ? 0 : prev[i];
+      const c = prev !== null && i >= bpp ? prev[i - bpp] : 0;
+      out[i] = cur[i] - paeth(a, b, c);
     }
-    if (ok && k0 >= 0) {
-      for (let i = 0; i < n; i++) if (px[i * 4 + 3] === 255 && ((px[i * 4] << 16) | (px[i * 4 + 1] << 8) | px[i * 4 + 2]) === k0) { ok = false; break; }
-    }
-    if (ok && k0 >= 0) key = k0;
   }
-  return { distinct: over ? 257 : counts.size, counts, grey, opaque, key };
 }
 
-// ---- forms: {colourType, bpp, raw, plte, trns, overhead, filters} ----
-function buildForms(img, an) {
-  const { width, height, px } = img, n = width * height, forms = [];
-  const add = (ct, bpp, raw, plte, trns, filters) => {
-    let oh = 0; if (plte) oh += plte.length + 12; if (trns) oh += trns.length + 12;
-    forms.push({ colourType: ct, bpp, raw, plte, trns, overhead: oh, filters });
-  };
-  if (an.distinct <= 256) {
-    const entries = [];
-    for (const [k, c] of an.counts) entries.push({ r: (k >>> 24) & 255, g: (k >>> 16) & 255, b: (k >>> 8) & 255, a: k & 255, count: c });
-    const orders = [
-      { name: 'count', list: [...entries].sort((x, y) => y.count - x.count) },
-      { name: 'lum', list: [...entries].sort((x, y) => (299 * x.r + 587 * x.g + 114 * x.b) - (299 * y.r + 587 * y.g + 114 * y.b)) },
-    ];
-    for (const { name, list } of orders) {
-      const trans = list.filter((e) => e.a !== 255).sort((x, y) => x.a - y.a);
-      const opaq = list.filter((e) => e.a === 255);
-      const fin = trans.concat(opaq);
-      const idx = new Map(), plte = new Uint8Array(fin.length * 3), al = new Uint8Array(fin.length);
-      for (let i = 0; i < fin.length; i++) { const e = fin[i]; idx.set(((e.r * 256 + e.g) * 256 + e.b) * 256 + e.a, i); plte[i * 3] = e.r; plte[i * 3 + 1] = e.g; plte[i * 3 + 2] = e.b; al[i] = e.a; }
-      let trns = null;
-      if (trans.length > 0) { let last = 0; for (let i = 0; i < fin.length; i++) if (fin[i].a !== 255) last = i; trns = al.subarray(0, last + 1); }
-      const raw = new Uint8Array(n);
-      for (let i = 0; i < n; i++) raw[i] = idx.get(((px[i * 4] * 256 + px[i * 4 + 1]) * 256 + px[i * 4 + 2]) * 256 + px[i * 4 + 3]);
-      add(3, 1, raw, plte, trns, name === 'count' ? [0] : [0, 'minsum', 'brute']);
+/** The sum of a filtered row's bytes read as signed (-128 to 127), absolute. */
+function signedSum(row) {
+  let s = 0;
+  for (let i = 0; i < row.length; i++) {
+    const v = row[i];
+    s += v < 128 ? v : 256 - v;
+  }
+  return s;
+}
+
+const CHANNELS = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 };
+
+/**
+ * Decode a PNG to RGBA (4 bytes a pixel, rows top to bottom). Reads the
+ * colour types the contest accepts; anything else throws.
+ */
+export function decodePng(bytes) {
+  if (bytes.length < 8) throw new Error('not a PNG');
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let at = 8;
+  let width = 0, height = 0, colourType = 6;
+  let palette = null, trns = null;
+  const idat = [];
+  while (at + 12 <= bytes.length) {
+    const len = view.getUint32(at);
+    const type = String.fromCharCode(bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]);
+    const data = bytes.subarray(at + 8, at + 8 + len);
+    at += 12 + len;
+    if (type === 'IHDR') {
+      const dv = new DataView(data.buffer, data.byteOffset, 13);
+      width = dv.getUint32(0); height = dv.getUint32(4);
+      if (data[8] !== 8 || data[12] !== 0) throw new Error('unsupported PNG');
+      colourType = data[9];
+    } else if (type === 'PLTE') palette = data;
+    else if (type === 'tRNS') trns = data;
+    else if (type === 'IDAT') idat.push(data);
+    else if (type === 'IEND') break;
+  }
+  const bpp = CHANNELS[colourType];
+  const stride = width * bpp;
+  const raw = inflateSync(Buffer.concat(idat));
+  const samples = new Uint8Array(height * stride);
+  for (let y = 0; y < height; y++) {
+    const ft = raw[y * (stride + 1)];
+    const src = y * (stride + 1) + 1;
+    const o = y * stride;
+    const p = o - stride;
+    if (ft === 0) samples.set(raw.subarray(src, src + stride), o);
+    else if (ft === 1) {
+      for (let i = 0; i < stride; i++) samples[o + i] = raw[src + i] + (i >= bpp ? samples[o + i - bpp] : 0);
+    } else if (ft === 2) {
+      for (let i = 0; i < stride; i++) samples[o + i] = raw[src + i] + (y > 0 ? samples[p + i] : 0);
+    } else if (ft === 3) {
+      for (let i = 0; i < stride; i++) samples[o + i] = raw[src + i] + (((i >= bpp ? samples[o + i - bpp] : 0) + (y > 0 ? samples[p + i] : 0)) >> 1);
+    } else {
+      for (let i = 0; i < stride; i++) {
+        const a = i >= bpp ? samples[o + i - bpp] : 0;
+        const b = y > 0 ? samples[p + i] : 0;
+        const c = y > 0 && i >= bpp ? samples[p + i - bpp] : 0;
+        samples[o + i] = raw[src + i] + paeth(a, b, c);
+      }
     }
-    if (!an.grey) return forms;
   }
-  if (an.grey) {
-    if (an.opaque) { const raw = new Uint8Array(n); for (let i = 0; i < n; i++) raw[i] = px[i * 4]; add(0, 1, raw, null, null, [0, 1, 2, 4, 'minsum', 'pairs', 'brute']); }
-    else if (an.key >= 0) { const raw = new Uint8Array(n); for (let i = 0; i < n; i++) raw[i] = px[i * 4]; add(0, 1, raw, null, new Uint8Array([0, an.key & 255]), [0, 1, 2, 4, 'minsum', 'pairs', 'brute']); }
-    else { const raw = new Uint8Array(n * 2); for (let i = 0; i < n; i++) { raw[i * 2] = px[i * 4]; raw[i * 2 + 1] = px[i * 4 + 3]; } add(4, 2, raw, null, null, [0, 1, 2, 4, 'minsum', 'pairs', 'brute']); }
-    return forms;
+  const n = width * height;
+  const rgba = new Uint8Array(n * 4);
+  if (colourType === 6) rgba.set(samples);
+  else if (colourType === 2) {
+    const key = trns === null ? -1 : (trns[1] << 16) | (trns[3] << 8) | trns[5];
+    for (let i = 0, s = 0, d = 0; i < n; i++, s += 3, d += 4) {
+      rgba[d] = samples[s]; rgba[d + 1] = samples[s + 1]; rgba[d + 2] = samples[s + 2];
+      rgba[d + 3] = ((samples[s] << 16) | (samples[s + 1] << 8) | samples[s + 2]) === key ? 0 : 255;
+    }
+  } else if (colourType === 0) {
+    const key = trns === null ? -1 : trns[1];
+    for (let i = 0, d = 0; i < n; i++, d += 4) {
+      const g = samples[i];
+      rgba[d] = rgba[d + 1] = rgba[d + 2] = g;
+      rgba[d + 3] = g === key ? 0 : 255;
+    }
+  } else if (colourType === 4) {
+    for (let i = 0, s = 0, d = 0; i < n; i++, s += 2, d += 4) {
+      rgba[d] = rgba[d + 1] = rgba[d + 2] = samples[s];
+      rgba[d + 3] = samples[s + 1];
+    }
+  } else {
+    const entries = palette.length / 3;
+    const lut = new Uint8Array(entries * 4);
+    for (let e = 0; e < entries; e++) {
+      lut[e * 4] = palette[e * 3];
+      lut[e * 4 + 1] = palette[e * 3 + 1];
+      lut[e * 4 + 2] = palette[e * 3 + 2];
+      lut[e * 4 + 3] = trns !== null && e < trns.length ? trns[e] : 255;
+    }
+    for (let i = 0, d = 0; i < n; i++, d += 4) {
+      const e = samples[i];
+      rgba[d] = lut[e * 4]; rgba[d + 1] = lut[e * 4 + 1]; rgba[d + 2] = lut[e * 4 + 2]; rgba[d + 3] = lut[e * 4 + 3];
+    }
   }
-  if (an.opaque) { const raw = new Uint8Array(n * 3); for (let i = 0; i < n; i++) { raw[i * 3] = px[i * 4]; raw[i * 3 + 1] = px[i * 4 + 1]; raw[i * 3 + 2] = px[i * 4 + 2]; } add(2, 3, raw, null, null, [0, 1, 2, 4, 'minsum', 'pairs', 'brute']); }
-  else if (an.key >= 0) {
-    const raw = new Uint8Array(n * 3);
-    for (let i = 0; i < n; i++) { raw[i * 3] = px[i * 4]; raw[i * 3 + 1] = px[i * 4 + 1]; raw[i * 3 + 2] = px[i * 4 + 2]; }
-    add(2, 3, raw, null, new Uint8Array([0, (an.key >> 16) & 255, 0, (an.key >> 8) & 255, 0, an.key & 255]), [0, 1, 2, 4, 'minsum', 'pairs', 'brute']);
-  } else add(6, 4, px, null, null, [0, 1, 2, 4, 'minsum', 'pairs', 'brute']);
+  return { rgba, width, height };
+}
+
+/**
+ * What the image holds: whether every pixel is opaque, whether every pixel is
+ * grey, and its colours (at most 256) with their counts. A colour's key is
+ * built from its bytes, so it is the same on every platform.
+ */
+export function analyse(rgba) {
+  const n = rgba.length >>> 2;
+  let opaque = true;
+  let grey = true;
+  const colours = new Map();
+  let many = false;
+  for (let i = 0, d = 0; i < n; i++, d += 4) {
+    const r = rgba[d], g = rgba[d + 1], b = rgba[d + 2], a = rgba[d + 3];
+    if (a !== 255) opaque = false;
+    if (r !== g || r !== b) grey = false;
+    if (!many) {
+      const key = (r << 24) | (g << 16) | (b << 8) | a;
+      const c = colours.get(key);
+      if (c === undefined) {
+        if (colours.size === 256) many = true;
+        else colours.set(key, { r, g, b, a, key, count: 1 });
+      } else c.count++;
+    }
+  }
+  return { opaque, grey, colours: many ? null : [...colours.values()] };
+}
+
+/**
+ * The one fully transparent value (grey or RGB) the image may key by tRNS
+ * instead of an alpha channel: every pixel is opaque or that exact value at
+ * alpha 0, and no opaque pixel holds that value. Null when there is none.
+ */
+function transparentKey(rgba, grey) {
+  let key = -1;
+  for (let d = 0; d < rgba.length; d += 4) {
+    const a = rgba[d + 3];
+    if (a === 255) continue;
+    if (a !== 0) return null;
+    const v = grey ? rgba[d] : (rgba[d] << 16) | (rgba[d + 1] << 8) | rgba[d + 2];
+    if (key === -1) key = v;
+    else if (key !== v) return null;
+  }
+  if (key === -1) return null;
+  for (let d = 0; d < rgba.length; d += 4) {
+    if (rgba[d + 3] !== 255) continue;
+    const v = grey ? rgba[d] : (rgba[d] << 16) | (rgba[d + 1] << 8) | rgba[d + 2];
+    if (v === key) return null;
+  }
+  return key;
+}
+
+/** The image's samples in colour type `ct` (0, 2, 4 or 6) from its RGBA. */
+function samplesOf(rgba, ct) {
+  const n = rgba.length >>> 2;
+  if (ct === 6) return rgba;
+  const ch = ct === 0 ? 1 : ct === 4 ? 2 : 3;
+  const out = new Uint8Array(n * ch);
+  for (let i = 0, d = 0, s = 0; i < n; i++, d += 4, s += ch) {
+    if (ct === 0) out[s] = rgba[d];
+    else if (ct === 4) { out[s] = rgba[d]; out[s + 1] = rgba[d + 3]; }
+    else { out[s] = rgba[d]; out[s + 1] = rgba[d + 1]; out[s + 2] = rgba[d + 2]; }
+  }
+  return out;
+}
+
+/** A palette's entries in trial order: transparent ones first (by alpha), then by `order`. */
+function paletteOrder(colours, order) {
+  const lum = (c) => 299 * c.r + 587 * c.g + 114 * c.b;
+  return [...colours].sort((x, y) => {
+    const ta = x.a === 255 ? 1 : 0;
+    const tb = y.a === 255 ? 1 : 0;
+    if (ta !== tb) return ta - tb;
+    if (ta === 0 && x.a !== y.a) return x.a - y.a;
+    if (order === 'luminance') return lum(x) - lum(y) || x.key - y.key;
+    return y.count - x.count || x.key - y.key;
+  });
+}
+
+/** The palette form: { plte, trns, indices }. */
+function paletteForm(rgba, colours, order) {
+  const entries = paletteOrder(colours, order);
+  const index = new Map(entries.map((c, i) => [c.key, i]));
+  const plte = new Uint8Array(entries.length * 3);
+  let transparent = 0;
+  entries.forEach((c, i) => {
+    plte[i * 3] = c.r;
+    plte[i * 3 + 1] = c.g;
+    plte[i * 3 + 2] = c.b;
+    if (c.a !== 255) transparent = i + 1;
+  });
+  const trns = transparent === 0 ? null : Uint8Array.from(entries.slice(0, transparent), (c) => c.a);
+  const n = rgba.length >>> 2;
+  const indices = new Uint8Array(n);
+  for (let i = 0, d = 0; i < n; i++, d += 4) {
+    indices[i] = index.get((rgba[d] << 24) | (rgba[d + 1] << 16) | (rgba[d + 2] << 8) | rgba[d + 3]);
+  }
+  return { plte, trns, indices };
+}
+
+/** The bytes a form's PLTE and tRNS chunks take in its file. */
+const chunkBytes = (form) => (form.plte === null ? 0 : 12 + form.plte.length) + (form.trns === null ? 0 : 12 + form.trns.length);
+
+/**
+ * The forms the image can be written in, each { colourType, bpp, samples,
+ * plte, trns }: a palette (two orderings) when it holds at most 256 colours,
+ * then a channel form when it is grey or holds more colours.
+ */
+export function formsOf(rgba) {
+  const { opaque, grey, colours } = analyse(rgba);
+  const forms = [];
+  if (colours !== null) {
+    for (const order of ['count', 'luminance']) {
+      const p = paletteForm(rgba, colours, order);
+      forms.push({ colourType: 3, bpp: 1, samples: p.indices, plte: p.plte, trns: p.trns });
+    }
+    if (!grey) return forms;
+  }
+  const key = opaque ? null : transparentKey(rgba, grey);
+  let ct;
+  let trns = null;
+  if (grey) {
+    ct = opaque || key !== null ? 0 : 4;
+    if (key !== null) trns = Uint8Array.of(0, key);
+  } else {
+    ct = opaque || key !== null ? 2 : 6;
+    if (key !== null) trns = Uint8Array.of(0, key >>> 16, 0, (key >>> 8) & 0xff, 0, key & 0xff);
+  }
+  const bpp = { 0: 1, 2: 3, 4: 2, 6: 4 }[ct];
+  forms.push({ colourType: ct, bpp, samples: samplesOf(rgba, ct), plte: null, trns });
   return forms;
 }
 
-// ---- one row, all five filters, into tmp[0..4] ----
-function filterRowInto(row, prevRow, bpp, tmp) {
-  const L = row.length;
-  for (let x = 0; x < L; x++) {
-    const v = row[x], a = x >= bpp ? row[x - bpp] : 0, up = prevRow[x], ul = x >= bpp ? prevRow[x - bpp] : 0;
-    const p = a + up - ul, pa = Math.abs(p - a), pb = Math.abs(p - up), pc = Math.abs(p - ul);
-    const pr = pa <= pb && pa <= pc ? a : (pb <= pc ? up : ul);
-    tmp[0][x] = v; tmp[1][x] = (v - a) & 255; tmp[2][x] = (v - up) & 255; tmp[3][x] = (v - ((a + up) >> 1)) & 255; tmp[4][x] = (v - pr) & 255;
+/**
+ * The five filtered variants of every row, in one buffer: variants[(t * height
+ * + y) * rowBytes] is the filter byte t, followed by the row filtered by t.
+ * Building it once lets the filter choice be re-run under several cost models
+ * without re-filtering.
+ */
+export function buildFilterCache(samples, width, height, bpp) {
+  const stride = width * bpp;
+  const rowBytes = stride + 1;
+  const variants = new Uint8Array(5 * height * rowBytes);
+  const cur = new Uint8Array(stride);
+  const prev = new Uint8Array(stride);
+  for (let y = 0; y < height; y++) {
+    const row = samples.subarray(y * stride, (y + 1) * stride);
+    const up = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
+    for (let t = 0; t < 5; t++) {
+      const at = (t * height + y) * rowBytes;
+      variants[at] = t;
+      filterRow(t, row, up, bpp, variants.subarray(at + 1, at + rowBytes));
+    }
   }
+  return { variants, rowBytes, stride, height };
 }
 
-// Fixed/minsum/pairs candidates in one pass; brute candidate separately.
-function filterCandidates(form, width, height) {
-  const bpp = form.bpp, rb = width * bpp, stride = rb + 1, raw = form.raw;
-  const out = {};
-  const fixed = [];
-  for (let k = 0; k < 5; k++) fixed.push(new Uint8Array(stride * height));
-  const minsum = new Uint8Array(stride * height), pairs = new Uint8Array(stride * height);
-  const tmp = [];
-  for (let f = 0; f < 5; f++) tmp.push(new Uint8Array(rb));
-  const prevRow = new Uint8Array(rb);
-  const seen = new Uint32Array(65536);
-  let gen = 0;
+/** The minimum-sum filtered stream of a form, from its filter cache. */
+export function minsumStream(cache) {
+  const { variants, rowBytes, stride, height } = cache;
+  const out = new Uint8Array(height * rowBytes);
+  const sums = new Float64Array(5);
   for (let y = 0; y < height; y++) {
-    const row = raw.subarray(y * rb, (y + 1) * rb);
-    filterRowInto(row, prevRow, bpp, tmp);
-    const sums = [0, 0, 0, 0, 0], pc = [0, 0, 0, 0, 0], pb = [-1, -1, -1, -1, -1];
-    const gs = [++gen, ++gen, ++gen, ++gen, ++gen];
-    for (let x = 0; x < rb; x++) for (let f = 0; f < 5; f++) {
-      const fv = tmp[f][x], sv = fv >= 128 ? fv - 256 : fv;
-      sums[f] += sv < 0 ? -sv : sv;
-      const pair = (pb[f] << 8) | fv;
-      if (pb[f] >= 0 && seen[pair] !== gs[f]) { seen[pair] = gs[f]; pc[f]++; }
-      pb[f] = fv;
+    let bestT = 0, bestS = Infinity;
+    for (let t = 0; t < 5; t++) {
+      const at = (t * height + y) * rowBytes + 1;
+      let s = 0;
+      for (let i = 0; i < stride; i++) { const v = variants[at + i]; s += v < 128 ? v : 256 - v; }
+      if (s < bestS) { bestS = s; bestT = t; }
     }
-    let bs = 0, bp = 0;
-    for (let f = 1; f < 5; f++) { if (sums[f] < sums[bs]) bs = f; if (pc[f] < pc[bp]) bp = f; }
-    const base = y * stride;
-    for (let f = 0; f < 5; f++) { fixed[f][base] = f; fixed[f].set(tmp[f], base + 1); }
-    minsum[base] = bs; minsum.set(tmp[bs], base + 1);
-    pairs[base] = bp; pairs.set(tmp[bp], base + 1);
-    prevRow.set(row);
-  }
-  for (let f = 0; f < 5; f++) out[f] = fixed[f];
-  out['minsum'] = minsum; out['pairs'] = pairs;
-  return out;
-}
-
-// Brute force: per row, the filter whose trial compresses smallest at zlib
-// level 4 with the previous 32 KiB of filtered output as dictionary.
-function bruteFiltered(form, width, height) {
-  const bpp = form.bpp, rb = width * bpp, stride = rb + 1, raw = form.raw;
-  const out = new Uint8Array(stride * height);
-  const trial = [];
-  for (let f = 0; f < 5; f++) { const t = new Uint8Array(stride); t[0] = f; trial.push(t); }
-  const tmp = [];
-  for (let f = 0; f < 5; f++) tmp.push(new Uint8Array(rb));
-  const prevRow = new Uint8Array(rb);
-  for (let y = 0; y < height; y++) {
-    const row = raw.subarray(y * rb, (y + 1) * rb);
-    filterRowInto(row, prevRow, bpp, tmp);
-    for (let f = 0; f < 5; f++) trial[f].set(tmp[f], 1);
-    const at = y * stride;
-    const before = out.subarray(Math.max(0, at - 32768), at);
-    let bt = 0, best = Infinity;
-    for (let f = 0; f < 5; f++) {
-      const cost = zlib.deflateSync(trial[f], before.length === 0 ? { level: 4, memLevel: 9 } : { level: 4, memLevel: 9, dictionary: before }).length;
-      if (cost < best) { best = cost; bt = f; }
-    }
-    out[at] = bt; out.set(tmp[bt], at + 1);
-    prevRow.set(row);
+    const src = (bestT * height + y) * rowBytes;
+    out.set(variants.subarray(src, src + rowBytes), y * rowBytes);
   }
   return out;
 }
 
-function encodePng(img, form, stream) {
-  const ihdr = new Uint8Array(13), dv = new DataView(ihdr.buffer);
-  dv.setUint32(0, img.width); dv.setUint32(4, img.height);
-  ihdr[8] = 8; ihdr[9] = form.colourType;
-  const parts = [new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr)];
-  if (form.plte) parts.push(chunk('PLTE', form.plte));
-  if (form.trns) parts.push(chunk('tRNS', form.trns));
-  parts.push(chunk('IDAT', stream));
-  parts.push(chunk('IEND', new Uint8Array(0)));
-  let total = 0; for (const p of parts) total += p.length;
-  const o = new Uint8Array(total); let n = 0;
-  for (const p of parts) { o.set(p, n); n += p.length; }
-  return o;
+/** The stream of one fixed filter for every row, from a filter cache. */
+export function fixedStream(cache, t) {
+  const { variants, rowBytes, height } = cache;
+  const out = new Uint8Array(height * rowBytes);
+  for (let y = 0; y < height; y++) {
+    const src = (t * height + y) * rowBytes;
+    out.set(variants.subarray(src, src + rowBytes), y * rowBytes);
+  }
+  return out;
 }
 
-function processImage(inFile, outFile) {
-  const img = decodePng(inFile), nPix = img.width * img.height;
-  const an = analyse(img.px, nPix), forms = buildForms(img, an);
+/** Fixed work budgets by filtered-stream size: no clock, so the run is deterministic. */
+export function settingsFor(n) {
+  if (n <= 1500000) return { cap: 2048, iters: 3, mode: 'all', top2: true };
+  return { cap: 256, iters: 3, mode: 'good', top2: false };
+}
+
+/**
+ * How many DEFLATE blocks to split `stream` into: zlib level 6 is run on the
+ * whole stream and on eight equal parts, and eight parts win only when their
+ * total is smaller. The proxy predicts the optimal-parse split decision on
+ * every practice image, and costs about one extra level-6 pass.
+ */
+export function splitParts(stream) {
+  const whole = deflateSync(stream, { level: 6, memLevel: 8 }).length;
+  const chunk = Math.ceil(stream.length / 8);
+  let split = 0;
+  for (let p = 0; p < 8; p++) {
+    split += deflateSync(stream.subarray(p * chunk, Math.min(stream.length, (p + 1) * chunk)), { level: 6, memLevel: 8 }).length;
+  }
+  return split < whole ? 8 : 1;
+}
+
+/**
+ * Refine one form: three filterings (every row unfiltered, brute force, and
+ * minimum-sum) are screened by zlib level 6, and the best two are written by
+ * the optimal-parse DEFLATE, each split into blocks when the proxy says the
+ * stream's statistics change along its length; the smaller wins, against a
+ * zlib level 9 stream of the same filtered data as fallback.
+ */
+export function refine(form, cache, minsum, width, height) {
+  const n = height * (width * form.bpp + 1);
+  const s = settingsFor(n);
+  const cands = [
+    fixedStream(cache, 0),
+    bruteStream(cache),
+    minsum,
+  ].map((stream) => ({ stream, z6: deflateSync(stream, { level: 6, memLevel: 8 }).length, parts: undefined }));
+  cands.sort((a, b) => a.z6 - b.z6);
+  // The split decision is only computed for a candidate that is actually
+  // written, so the third candidate costs just its level-6 screen.
+  const partsOf = (cand) => {
+    if (cand.parts === undefined) cand.parts = splitParts(cand.stream);
+    return cand.parts;
+  };
+  const write = (cand) => {
+    const parts = partsOf(cand);
+    const r = parts === 1
+      ? deflateZlib(cand.stream, { chainCap: s.cap, iterations: s.iters, mode: s.mode })
+      : deflateZlibSplit(cand.stream, parts, { chainCap: s.cap, iterations: s.iters, mode: s.mode });
+    return { zlib: r.zlib, bytes: r.bytes };
+  };
+  let best = write(cands[0]);
+  let bestStream = cands[0].stream;
+  // A second candidate is written when it can plausibly win: on the small
+  // streams whenever it is close by the level-6 screen, and on the large
+  // streams when the two candidates disagree about splitting — the split
+  // gain differs per stream, so the screen's ranking can flip there. On the
+  // large streams the screen's ranking otherwise already matches the
+  // optimal-parse ranking, so the second pass buys nothing.
+  const close = cands[1].z6 < cands[0].z6 * 1.05;
+  const splitDiffers = close && !s.top2 ? partsOf(cands[0]) !== partsOf(cands[1]) : false;
+  if (close && (s.top2 || splitDiffers)) {
+    const second = write(cands[1]);
+    if (second.bytes < best.bytes) { best = second; bestStream = cands[1].stream; }
+  }
+  const z9 = deflateSync(bestStream, { level: 9, memLevel: 9 });
+  if (z9.length < best.bytes) return z9;
+  return best.zlib;
+}
+
+/** Screen one form: its minimum-sum stream, weighed by zlib level 6 plus its chunk overhead. */
+export function screenForm(form, width, height) {
+  const cache = buildFilterCache(form.samples, width, height, form.bpp);
+  const stream = minsumStream(cache);
+  const z = deflateSync(stream, { level: 6, memLevel: 8 });
+  return { cache, stream, score: z.length + chunkBytes(form) };
+}
+
+/** The answer PNG for one image. */
+export function processImage(rgba, width, height) {
+  const forms = formsOf(rgba);
   let best = null;
   for (const form of forms) {
-    const cands = filterCandidates(form, img.width, img.height);
-    for (const choice of form.filters) {
-      let filtered;
-      if (choice === 'brute') filtered = bruteFiltered(form, img.width, img.height);
-      else filtered = cands[choice];
-      const z = zlib.deflateSync(filtered, { level: 6, memLevel: 8 });
-      const weight = z.length + form.overhead;
-      if (best === null || weight < best.weight) best = { weight, form, filtered, choice, z6len: z.length };
-    }
+    const s = screenForm(form, width, height);
+    if (best === null || s.score < best.score) best = { form, cache: s.cache, stream: s.stream, score: s.score };
   }
-  const n = best.filtered.length;
-  const cfg = n <= 1048576 ? { chain: 8192, interior: { chain: 256, span: 100000, minLen: 8 } }
-    : n <= 3145728 ? { chain: 8192, interior: { chain: 128, span: 100000, minLen: 8 } }
-    : { chain: 4096, interior: { chain: 128, span: 100000, minLen: 12 } };
-  const custom = zlibWrap(deflateOpt(best.filtered, { chain: cfg.chain, nice: 258, interior: cfg.interior }), best.filtered);
-  const z9 = zlib.deflateSync(best.filtered, { level: 9 });
-  const stream = custom.length <= z9.length ? custom : z9;
-  const png = encodePng(img, best.form, stream);
-  fs.mkdirSync(path.dirname(outFile), { recursive: true });
-  fs.writeFileSync(outFile, png);
-  return { distinct: an.distinct, grey: an.grey, opaque: an.opaque, key: an.key, ct: best.form.colourType, choice: best.choice, z6: best.z6len, custom: custom.length, z9: z9.length, bytes: png.length, overhead: best.form.overhead };
+  const zlib = refine(best.form, best.cache, best.stream, width, height);  const chunks = [['IHDR', ihdrOf(width, height, best.form.colourType)]];
+  if (best.form.plte !== null) chunks.push(['PLTE', best.form.plte]);
+  if (best.form.trns !== null) chunks.push(['tRNS', best.form.trns]);
+  chunks.push(['IDAT', zlib]);
+  chunks.push(['IEND', new Uint8Array(0)]);
+  return pngOf(chunks);
 }
 
 function main() {
-  const inputDir = process.env.MAKEFUN_INPUT_DIR || '/input';
-  const outputDir = process.env.MAKEFUN_OUTPUT_DIR || '/output';
-  const ids = fs.readdirSync(inputDir).filter((d) => { try { return fs.statSync(path.join(inputDir, d)).isDirectory(); } catch { return false; } }).sort();
-  for (const id of ids) {
-    const inFile = path.join(inputDir, id, 'image.png'), outFile = path.join(outputDir, id, 'image.png');
-    if (!fs.existsSync(inFile)) { console.log(id + ' SKIP no input'); continue; }
-    const r = processImage(inFile, outFile);
-    console.log(id + ' distinct=' + r.distinct + ' grey=' + r.grey + ' opaque=' + r.opaque + ' key=' + r.key + ' ct=' + r.ct + ' filter=' + r.choice + ' z6=' + r.z6 + ' custom=' + r.custom + ' z9=' + r.z9 + ' bytes=' + r.bytes);
+  const I = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+  const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+  for (const id of readdirSync(I).sort()) {
+    const { rgba, width, height } = decodePng(readFileSync(join(I, id, 'image.png')));
+    const png = processImage(rgba, width, height);
+    mkdirSync(join(O, id), { recursive: true });
+    writeFileSync(join(O, id, 'image.png'), png);
   }
 }
-main();
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();
+
+/**
+ * The brute-force filtered stream: each row is tried under all five filters,
+ * each compressed by zlib at level 4 after the 32 KiB written before it, and
+ * the smallest is kept. This is the filter choice that matters most for
+ * rich, alpha and grey images, where a filter's value is in the matches it
+ * creates, not in its byte distribution.
+ */
+export function bruteStream(cache) {
+  const { variants, rowBytes, height } = cache;
+  const out = new Uint8Array(height * rowBytes);
+  const CONTEXT = 32768;
+  for (let y = 0; y < height; y++) {
+    const at = y * rowBytes;
+    const before = out.subarray(Math.max(0, at - CONTEXT), at);
+    let bestT = 0, bestLen = Infinity;
+    for (let t = 0; t < 5; t++) {
+      const src = (t * height + y) * rowBytes;
+      const trial = variants.subarray(src, src + rowBytes);
+      const len = deflateSync(trial, before.length === 0
+        ? { level: 4, memLevel: 9 }
+        : { level: 4, memLevel: 9, dictionary: before }).length;
+      if (len < bestLen) { bestLen = len; bestT = t; }
+    }
+    const src = (bestT * height + y) * rowBytes;
+    out.set(variants.subarray(src, src + rowBytes), at);
+  }
+  return out;
+}
