@@ -1,614 +1,63 @@
-// deflate.mjs — a from-scratch DEFLATE encoder (optimal-parse, zopfli-style).
-// Pure Node standard library. Deterministic: fixed budgets only, no clock,
-// no randomness. Written for the png-squeeze entry: it takes filtered PNG
-// row data and returns a zlib stream.
-//
-// Design:
-//   1. Match search: one left-to-right pass over the data with a hash table
-//      of 3-byte sequences and chains of previous positions. At each position
-//      the walk records the Pareto frontier of (length, distance) pairs:
-//      distances grow as the chain is walked (positions strictly decrease),
-//      so a candidate only matters when its length beats every length seen
-//      at a nearer distance. The frontier is cached and reused by every
-//      dynamic-programming pass.
-//   2. Optimal parse: a shortest-path DP over the data with true bit costs
-//      (literal / length / distance symbol costs from the current Huffman
-//      tables). Iterated: start from fixed-Huffman costs, re-parse, rebuild
-//      the Huffman tables from the parse's frequencies, re-parse again.
-//   3. Block splitting: the data is cut into a fixed number of uniform
-//      blocks; each block gets its own Huffman tables, and each block is
-//      emitted either as a dynamic-Huffman block or a fixed-Huffman block,
-//      whichever is exactly smaller in bits.
-//   4. Huffman lengths are built with a heap and then length-limited to 15
-//      with the classic overflow redistribution.
+// deflate.mjs — a from-scratch optimal-parse DEFLATE compressor (zlib wrapper).
+// Written fresh for the png-squeeze entry. Pure Node standard library.
+// Design: hash-chain match search with a Pareto frontier of candidates and
+// sub-length expansion, an optimal-parse dynamic program with true bit costs
+// and cost-table refinement, package-merge length-limited Huffman codes,
+// adaptive multi-block output with per-block tables, and a zlib-9 fallback.
+// Deterministic: fixed budgets only, no clock, no randomness.
 
-const LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
-const LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
-const DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
-const DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+import { deflateSync } from 'node:zlib';
 
-// Length code (257..285) and extra-bit count for every match length 3..258.
-const LEN_CODE = new Uint16Array(259);
-// Right endpoint of each length code's range (lengths 3..258).
-const RANGE_END = LEN_BASE.map((b, c) => (c === 28 ? 258 : LEN_BASE[c + 1] - 1));
-const LEN_EXT = new Uint8Array(259);
-for (let c = 0; c < 29; c++) {
-  const span = c === 28 ? 1 : LEN_BASE[c + 1] - LEN_BASE[c];
-  for (let k = 0; k < span; k++) {
-    LEN_CODE[LEN_BASE[c] + k] = 257 + c;
-    LEN_EXT[LEN_BASE[c] + k] = LEN_EXTRA[c];
+// ---- DEFLATE tables (RFC 1951) -------------------------------------------
+
+export const LEN_BASE = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+export const LEN_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+export const DIST_BASE = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+export const DIST_EXTRA = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+// Length symbol (257..285) for every match length 3..258.
+export const LEN_SYM = (() => {
+  const t = new Int16Array(259);
+  for (let s = 0; s < 29; s++) {
+    const base = LEN_BASE[s];
+    const next = s === 28 ? 259 : LEN_BASE[s + 1];
+    for (let l = base; l < next; l++) t[l] = 257 + s;
   }
-}
-// Distance code (0..29) and extra-bit count for every distance 1..32768.
-const DIST_CODE = new Uint8Array(32769);
-const DIST_EXT = new Uint8Array(32769);
-for (let c = 0; c < 30; c++) {
-  const span = c === 29 ? 32768 - DIST_BASE[c] + 1 : DIST_BASE[c + 1] - DIST_BASE[c];
-  for (let k = 0; k < span; k++) {
-    DIST_CODE[DIST_BASE[c] + k] = c;
-    DIST_EXT[DIST_BASE[c] + k] = DIST_EXTRA[c];
+  return t;
+})();
+// Distance symbol (0..29) for every distance 1..32768.
+export const DIST_SYM = (() => {
+  const t = new Int16Array(32769);
+  for (let s = 0; s < 30; s++) {
+    const base = DIST_BASE[s];
+    const next = s === 29 ? 32769 : DIST_BASE[s + 1];
+    for (let d = base; d < next; d++) t[d] = s;
   }
-}
-// Fixed-Huffman code lengths (DEFLATE spec).
-const FIXED_LIT_LEN = new Uint8Array(288);
-for (let i = 0; i < 144; i++) FIXED_LIT_LEN[i] = 8;
-for (let i = 144; i < 256; i++) FIXED_LIT_LEN[i] = 9;
-for (let i = 256; i < 280; i++) FIXED_LIT_LEN[i] = 7;
-for (let i = 280; i < 288; i++) FIXED_LIT_LEN[i] = 8;
-const FIXED_DIST_LEN = new Uint8Array(30).fill(5);
+  return t;
+})();
+// Fixed Huffman lengths.
+export const FIXED_LIT_LEN = (() => {
+  const t = new Int16Array(288);
+  for (let s = 0; s < 144; s++) t[s] = 8;
+  for (let s = 144; s < 256; s++) t[s] = 9;
+  for (let s = 256; s < 280; s++) t[s] = 7;
+  for (let s = 280; s < 288; s++) t[s] = 8;
+  return t;
+})();
+export const FIXED_DIST_LEN = (() => {
+  const t = new Int16Array(32);
+  for (let s = 0; s < 32; s++) t[s] = 5;
+  return t;
+})();
 
-const MAX_MATCH = 258;
-const MIN_MATCH = 3;
-const WINDOW = 32768;
-const HASH_BITS = 20;
-const HASH_SIZE = 1 << HASH_BITS;
-const HASH_MASK = HASH_SIZE - 1;
+// ---- checksums ------------------------------------------------------------
 
-function hash3(a, b, c) {
-  // A cheap 3-byte mix; collisions only cost a wasted comparison.
-  return (((a << 10) ^ (b << 5) ^ c) * 2654435761) >>> (32 - HASH_BITS) & HASH_MASK;
-}
-
-// Length of the match between data[i..] and data[j..], at most maxLen.
-// The caller guarantees data[i + best] and data[j + best] were already
-// compared when best > 0, so this only runs when a longer match is possible.
-// When i and j share their alignment mod 4, the bulk of the comparison
-// runs four bytes at a time through a 32-bit view; otherwise it falls
-// back to the byte loop.
-function matchLength(data, u32, i, j, maxLen) {
-  let l = 0;
-  if (u32 !== null && (i & 3) === (j & 3)) {
-    const align = (4 - (i & 3)) & 3;
-    while (l < align && l < maxLen && data[i + l] === data[j + l]) l++;
-    if (l < align) return l;
-    while (l + 4 <= maxLen) {
-      if (u32[(i + l) >>> 2] !== u32[(j + l) >>> 2]) break;
-      l += 4;
-    }
-    while (l < maxLen && data[i + l] === data[j + l]) l++;
-    return l;
-  }
-  while (l < maxLen && data[i + l] === data[j + l]) l++;
-  return l;
-}
-
-// One pass over the data: build the Pareto frontier of matches at every
-// position. Returns { lens, dists, counts } with at most MAXF pairs per
-// position, lens stored as length, dists as distance.
-const MAXF = 32;
-function findFrontiers(data, chainCap) {
+export function adler32(data) {
+  let a = 1;
+  let b = 0;
   const n = data.length;
-  const head = new Int32Array(HASH_SIZE).fill(-1);
-  const prev = new Int32Array(n);
-  const u32 = data.byteOffset % 4 === 0 ? new Uint32Array(data.buffer, data.byteOffset, data.length >>> 2) : null;
-  const lens = new Uint16Array(n * MAXF);
-  const dists = new Uint16Array(n * MAXF);
-  const counts = new Uint8Array(n);
-  const fLen = new Uint16Array(MAXF);
-  const fDist = new Uint16Array(MAXF);
-  for (let i = 0; i < n; i++) {
-    if (i + MIN_MATCH > n) break;
-    const h = hash3(data[i], data[i + 1], data[i + 2]);
-    let j = head[h];
-    head[h] = i;
-    prev[i] = j;
-    const maxLen = Math.min(MAX_MATCH, n - i);
-    const minJ = i - WINDOW;
-    let best = MIN_MATCH - 1; // best length found so far
-    let f = 0;
-    let walked = 0;
-    // Loop-invariant reads, refreshed only when `best` grows.
-    let targetByte = data[i + best];
-    let targetByteM1 = data[i + best - 1];
-    while (j >= 0 && j >= minJ && walked < chainCap) {
-      walked++;
-      const dist = i - j;
-      if (best < maxLen && data[j + best] === targetByte && (best === 0 || data[j + best - 1] === targetByteM1)) {
-        const l = matchLength(data, u32, i, j, maxLen);
-        if (l > best) {
-          best = l;
-          targetByte = data[i + best];
-          targetByteM1 = data[i + best - 1];
-          if (f < MAXF) {
-            fLen[f] = l;
-            fDist[f] = dist;
-            f++;
-          }
-          if (l >= MAX_MATCH) break;
-        }
-      }
-      j = prev[j];
-    }
-    if (f > 0) {
-      counts[i] = f;
-      const base = i * MAXF;
-      for (let k = 0; k < f; k++) {
-        lens[base + k] = fLen[k];
-        dists[base + k] = fDist[k];
-      }
-    }
-  }
-  return { lens, dists, counts };
-}
-
-// ---- Huffman lengths -------------------------------------------------------
-
-// Build length-limited Huffman code lengths (max 15) from frequencies.
-// Heap-based tree build, then the overflow redistribution: lengths over the
-// cap are folded back down, and lengths are reassigned by frequency rank.
-function buildLengths(freq, maxLen) {
-  const n = freq.length;
-  const lengths = new Uint8Array(n);
-  let used = 0;
-  for (let i = 0; i < n; i++) if (freq[i] > 0) used++;
-  if (used === 0) return lengths;
-  if (used === 1) {
-    for (let i = 0; i < n; i++) if (freq[i] > 0) lengths[i] = 1;
-    return lengths;
-  }
-  // Heap of node indices; leaves 0..n-1, internal nodes n.. .
-  const weight = new Float64Array(2 * n);
-  const depth = new Uint8Array(2 * n);
-  const left = new Int32Array(2 * n).fill(-1);
-  const right = new Int32Array(2 * n).fill(-1);
-  for (let i = 0; i < n; i++) weight[i] = freq[i];
-  const heap = [];
-  for (let i = 0; i < n; i++) if (freq[i] > 0) heap.push(i);
-  const less = (a, b) => weight[a] < weight[b] || (weight[a] === weight[b] && a < b);
-  const push = (x) => {
-    heap.push(x);
-    let k = heap.length - 1;
-    while (k > 0) {
-      const p = (k - 1) >> 1;
-      if (less(heap[k], heap[p])) {
-        const t = heap[k]; heap[k] = heap[p]; heap[p] = t;
-        k = p;
-      } else break;
-    }
-  };
-  const pop = () => {
-    const top = heap[0];
-    const last = heap.pop();
-    if (heap.length > 0) {
-      heap[0] = last;
-      let k = 0;
-      for (;;) {
-        const l = k * 2 + 1, r = l + 1;
-        let s = k;
-        if (l < heap.length && less(heap[l], heap[s])) s = l;
-        if (r < heap.length && less(heap[r], heap[s])) s = r;
-        if (s === k) break;
-        const t = heap[k]; heap[k] = heap[s]; heap[s] = t;
-        k = s;
-      }
-    }
-    return top;
-  };
-  // Heapify the initial leaves.
-  for (let k = (heap.length >> 1) - 1; k >= 0; k--) {
-    let p = k;
-    for (;;) {
-      const l = p * 2 + 1, r = l + 1;
-      let s = p;
-      if (l < heap.length && less(heap[l], heap[s])) s = l;
-      if (r < heap.length && less(heap[r], heap[s])) s = r;
-      if (s === p) break;
-      const t = heap[p]; heap[p] = heap[s]; heap[s] = t;
-      p = s;
-    }
-  }
-  let next = n;
-  while (heap.length > 1) {
-    const a = pop();
-    const b = pop();
-    weight[next] = weight[a] + weight[b];
-    left[next] = a;
-    right[next] = b;
-    depth[next] = 0;
-    push(next);
-    next++;
-  }
-  const root = heap[0];
-  // Depths by walking the tree.
-  const stack = [root];
-  const dstack = [0];
-  while (stack.length > 0) {
-    const node = stack.pop();
-    const d = dstack.pop();
-    if (node < n) {
-      lengths[node] = d;
-    } else {
-      stack.push(left[node]); dstack.push(d + 1);
-      stack.push(right[node]); dstack.push(d + 1);
-    }
-  }
-  // Length limiting: cap the over-long lengths, then repair the Kraft sum
-  // back to exactly 1. Capping only raises the sum, so the repair only
-  // ever needs to lower it. One repair step — split a code of length
-  // m < maxLen into two of length m+1, and drop one code of length
-  // maxLen — lowers the sum (in units of 2^-maxLen) by exactly 1, so
-  // looping until the sum is 2^maxLen always terminates with a complete
-  // code (a code shorter than maxLen always exists to split while the sum
-  // is above 1, since at most 2^maxLen codes fit at length maxLen).
-  const blCount = new Int32Array(maxLen + 1);
-  for (let i = 0; i < n; i++) {
-    if (lengths[i] > maxLen) lengths[i] = maxLen;
-    if (lengths[i] > 0) blCount[lengths[i]]++;
-  }
-  const target = 1 << maxLen;
-  let total = 0;
-  for (let l = 1; l <= maxLen; l++) total += blCount[l] * (1 << (maxLen - l));
-  while (total > target) {
-    let m = maxLen - 1;
-    while (m > 0 && blCount[m] === 0) m--;
-    if (m === 0) break; // cannot happen for a feasible alphabet
-    blCount[m]--;
-    blCount[m + 1] += 2;
-    blCount[maxLen]--;
-    total -= 1;
-  }
-  // Reassign lengths by frequency rank: most frequent gets shortest.
-  const order = [];
-  for (let i = 0; i < n; i++) if (freq[i] > 0) order.push(i);
-  order.sort((a, b) => freq[b] - freq[a] || a - b);
-  let oi = 0;
-  for (let l = 1; l <= maxLen; l++) {
-    for (let k = 0; k < blCount[l]; k++) {
-      lengths[order[oi++]] = l;
-    }
-  }
-  return lengths;
-}
-
-// Canonical Huffman codes from lengths: returns { codes, lengths } with
-// codes bit-reversed for LSB-first DEFLATE emission.
-function canonicalCodes(lengths) {
-  const n = lengths.length;
-  const maxLen = Math.max(1, ...lengths);
-  const blCount = new Int32Array(maxLen + 1);
-  for (let i = 0; i < n; i++) if (lengths[i] > 0) blCount[lengths[i]]++;
-  const nextCode = new Int32Array(maxLen + 1);
-  let code = 0;
-  for (let l = 1; l <= maxLen; l++) {
-    code = (code + blCount[l - 1]) << 1;
-    nextCode[l] = code;
-  }
-  const codes = new Uint32Array(n);
-  for (let i = 0; i < n; i++) {
-    const l = lengths[i];
-    if (l === 0) continue;
-    let c = nextCode[l]++;
-    // Reverse l bits for LSB-first output.
-    let r = 0;
-    for (let k = 0; k < l; k++) {
-      r = (r << 1) | (c & 1);
-      c >>= 1;
-    }
-    codes[i] = r;
-  }
-  return { codes, lengths };
-}
-
-// ---- Bit writer -------------------------------------------------------------
-
-class BitWriter {
-  constructor(capacity) {
-    this.out = new Uint8Array(capacity);
-    this.pos = 0;
-    this.bitBuf = 0;
-    this.bitCnt = 0;
-    this.bitLen = 0;
-  }
-  write(code, len) {
-    this.bitLen += len;
-    this.bitBuf |= code << this.bitCnt;
-    this.bitCnt += len;
-    while (this.bitCnt >= 8) {
-      this.out[this.pos++] = this.bitBuf & 0xff;
-      this.bitBuf >>>= 8;
-      this.bitCnt -= 8;
-    }
-  }
-  // Append another writer's bits (LSB-first packing) into this one.
-  append(other) {
-    const nBytes = Math.ceil(other.bitLen / 8);
-    let remaining = other.bitLen;
-    for (let i = 0; i < nBytes; i++) {
-      const take = Math.min(8, remaining);
-      this.writeBits(other.out[i], take);
-      remaining -= take;
-    }
-  }
-  writeBits(value, len) {
-    // value's low `len` bits, LSB first.
-    this.write(value & ((1 << len) - 1), len);
-  }
-  finish() {
-    if (this.bitCnt > 0) {
-      this.out[this.pos++] = this.bitBuf & 0xff;
-      this.bitBuf = 0;
-      this.bitCnt = 0;
-    }
-    return this.out.subarray(0, this.pos);
-  }
-}
-
-// ---- Optimal parse ----------------------------------------------------------
-
-// Per-symbol cost tables for one DP run, from Huffman lengths.
-function costTables(litLen, distLen) {
-  const litCost = new Float64Array(288);
-  for (let i = 0; i < 288; i++) litCost[i] = litLen[i];
-  const lenCost = new Float64Array(259);
-  for (let l = 3; l <= 258; l++) lenCost[l] = litLen[LEN_CODE[l]] + LEN_EXT[l];
-  const distCost = new Float64Array(32769);
-  for (let d = 1; d <= 32768; d++) distCost[d] = distLen[DIST_CODE[d]] + DIST_EXT[d];
-  return { litCost, lenCost, distCost };
-}
-
-// DP parse of data[start..end) using cached frontiers. Returns symbol
-// arrays: lit[i] = literal byte (0..255) or -1; len[i] / dist[i] for a match.
-// When `expand` is set, each frontier pair (length L0, distance D) also
-// offers every shorter length that ends a length-code range (plus length
-// 3): a match of length L0 at distance D contains every shorter length
-// at the same distance, and within a length-code range the bit cost is
-// constant, so the range's right endpoint dominates the rest of the range
-// — except that the DP may need to end the match early to align with the
-// next match, which is what the range endpoints give it.
-function parseBlock(data, start, end, frontiers, tables, expand = false) {
-  const len = end - start;
-  const cost = new Float64Array(len + 1).fill(Infinity);
-  const prevLen = new Uint16Array(len + 1);
-  const prevDist = new Uint32Array(len + 1);
-  cost[0] = 0;
-  const { litCost, lenCost, distCost } = tables;
-  const { lens, dists, counts } = frontiers;
-  for (let i = 0; i < len; i++) {
-    const base = cost[i];
-    if (base === Infinity) continue;
-    const pos = start + i;
-    const remain = len - i;
-    // Literal edge.
-    const lc = base + litCost[data[pos]];
-    if (lc < cost[i + 1]) {
-      cost[i + 1] = lc;
-      prevLen[i + 1] = 0;
-      prevDist[i + 1] = 0;
-    }
-    // Match edges from the frontier.
-    const fc = counts[pos];
-    if (fc > 0 && remain >= 3) {
-      const fb = pos * MAXF;
-      for (let k = 0; k < fc; k++) {
-        const L0 = lens[fb + k];
-        const D = dists[fb + k];
-        const dc = distCost[D];
-        if (!expand) {
-          let L = L0 > remain ? remain : L0;
-          if (L >= 3) {
-            const mc = base + lenCost[L] + dc;
-            if (mc < cost[i + L]) {
-              cost[i + L] = mc;
-              prevLen[i + L] = L;
-              prevDist[i + L] = D;
-            }
-          }
-          continue;
-        }
-        let prevL = -1;
-        for (let c = 0; c < 29; c++) {
-          const lo = LEN_BASE[c];
-          if (lo > L0) break;
-          let L = RANGE_END[c];
-          if (L > L0) L = L0;
-          if (L > remain) L = remain;
-          if (L < 3 || L === prevL) continue;
-          prevL = L;
-          const mc = base + lenCost[L] + dc;
-          if (mc < cost[i + L]) {
-            cost[i + L] = mc;
-            prevLen[i + L] = L;
-            prevDist[i + L] = D;
-          }
-        }
-        // Length 3 itself, for alignment when the range endpoints overshoot.
-        if (L0 >= 3 && prevL !== 3) {
-          const mc = base + lenCost[3] + dc;
-          if (mc < cost[i + 3]) {
-            cost[i + 3] = mc;
-            prevLen[i + 3] = 3;
-            prevDist[i + 3] = D;
-          }
-        }
-      }
-    }
-  }
-  // Backtrack: count symbols, then fill arrays forward.
-  let nSym = 0;
-  let p = len;
-  while (p > 0) {
-    nSym++;
-    p -= prevLen[p] === 0 ? 1 : prevLen[p];
-  }
-  const symLit = new Int16Array(nSym);
-  const symLen = new Uint16Array(nSym);
-  const symDist = new Uint16Array(nSym);
-  let s = nSym - 1;
-  p = len;
-  while (p > 0) {
-    const L = prevLen[p];
-    if (L === 0) {
-      symLit[s] = data[start + p - 1];
-      symLen[s] = 0;
-      symDist[s] = 0;
-      p -= 1;
-    } else {
-      symLit[s] = -1;
-      symLen[s] = L;
-      symDist[s] = prevDist[p];
-      p -= L;
-    }
-    s--;
-  }
-  return { symLit, symLen, symDist, nSym, cost: cost[len] + litCost[256] };
-}
-
-function frequencies(symLit, symLen, symDist, nSym) {
-  const litFreq = new Float64Array(288);
-  const distFreq = new Float64Array(30);
-  for (let s = 0; s < nSym; s++) {
-    if (symLit[s] >= 0) litFreq[symLit[s]]++;
-    else {
-      litFreq[LEN_CODE[symLen[s]]]++;
-      distFreq[DIST_CODE[symDist[s]]]++;
-    }
-  }
-  litFreq[256]++; // end of block
-  return { litFreq, distFreq };
-}
-
-// Emit one block's symbols with the given tables into a BitWriter.
-function emitBlock(bw, symLit, symLen, symDist, nSym, litCode, distCode, isLast) {
-  bw.writeBits(isLast ? 1 : 0, 1);
-  bw.writeBits(2, 2); // dynamic Huffman block
-  // Build the code-length sequence over lit (trimmed) + dist (trimmed) lengths.
-  const litLen = litCode.lengths;
-  const distLen = distCode.lengths;
-  let hlit = 286;
-  while (hlit > 257 && litLen[hlit - 1] === 0) hlit--;
-  let hdist = 30;
-  while (hdist > 1 && distLen[hdist - 1] === 0) hdist--;
-  const seq = new Uint8Array(hlit + hdist);
-  seq.set(litLen.subarray(0, hlit));
-  seq.set(distLen.subarray(0, hdist), hlit);
-  // RLE the sequence with symbols 16/17/18.
-  const clSyms = [];
-  const clExtra = [];
   let i = 0;
-  while (i < seq.length) {
-    const v = seq[i];
-    let run = 1;
-    while (i + run < seq.length && seq[i + run] === v) run++;
-    if (v === 0) {
-      let left = run;
-      while (left >= 11) {
-        const take = Math.min(left, 138);
-        clSyms.push(18); clExtra.push(take - 11);
-        left -= take;
-      }
-      if (left >= 3) {
-        clSyms.push(17); clExtra.push(left - 3);
-        left = 0;
-      }
-      while (left-- > 0) { clSyms.push(0); clExtra.push(0); }
-    } else {
-      clSyms.push(v); clExtra.push(0);
-      let left = run - 1;
-      while (left >= 3) {
-        const take = Math.min(left, 6);
-        clSyms.push(16); clExtra.push(take - 3);
-        left -= take;
-      }
-      while (left-- > 0) { clSyms.push(v); clExtra.push(0); }
-    }
-    i += run;
-  }
-  const clFreq = new Float64Array(19);
-  for (const s of clSyms) clFreq[s]++;
-  const clLen = buildLengths(clFreq, 7);
-  const clCode = canonicalCodes(clLen);
-  const ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
-  let hclen = 19;
-  while (hclen > 4 && clLen[ORDER[hclen - 1]] === 0) hclen--;
-  bw.writeBits(hlit - 257, 5);
-  bw.writeBits(hdist - 1, 5);
-  bw.writeBits(hclen - 4, 4);
-  for (let k = 0; k < hclen; k++) bw.writeBits(clLen[ORDER[k]], 3);
-  const CL_EXTRA = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 3, 7];
-  for (let k = 0; k < clSyms.length; k++) {
-    const s = clSyms[k];
-    bw.write(clCode.codes[s], clCode.lengths[s]);
-    if (CL_EXTRA[s] > 0) bw.writeBits(clExtra[k], CL_EXTRA[s]);
-  }
-  // Symbols.
-  for (let s = 0; s < nSym; s++) {
-    if (symLit[s] >= 0) {
-      const v = symLit[s];
-      bw.write(litCode.codes[v], litCode.lengths[v]);
-    } else {
-      const L = symLen[s];
-      const D = symDist[s];
-      const lc = LEN_CODE[L];
-      bw.write(litCode.codes[lc], litCode.lengths[lc]);
-      if (LEN_EXT[L] > 0) bw.writeBits(L - LEN_BASE[lc - 257], LEN_EXT[L]);
-      const dc = DIST_CODE[D];
-      bw.write(distCode.codes[dc], distCode.lengths[dc]);
-      if (DIST_EXT[D] > 0) bw.writeBits(D - DIST_BASE[dc], DIST_EXT[D]);
-    }
-  }
-  bw.write(litCode.codes[256], litCode.lengths[256]);
-}
-
-// Emit the same symbols as a fixed-Huffman block.
-function emitFixedBlock(bw, symLit, symLen, symDist, nSym, isLast) {
-  const litCode = canonicalCodes(FIXED_LIT_LEN);
-  const distCode = canonicalCodes(FIXED_DIST_LEN);
-  bw.writeBits(isLast ? 1 : 0, 1);
-  bw.writeBits(1, 2); // fixed Huffman block
-  for (let s = 0; s < nSym; s++) {
-    if (symLit[s] >= 0) {
-      const v = symLit[s];
-      bw.write(litCode.codes[v], litCode.lengths[v]);
-    } else {
-      const L = symLen[s];
-      const D = symDist[s];
-      const lc = LEN_CODE[L];
-      bw.write(litCode.codes[lc], litCode.lengths[lc]);
-      if (LEN_EXT[L] > 0) bw.writeBits(L - LEN_BASE[lc - 257], LEN_EXT[L]);
-      const dc = DIST_CODE[D];
-      bw.write(distCode.codes[dc], distCode.lengths[dc]);
-      if (DIST_EXT[D] > 0) bw.writeBits(D - DIST_BASE[dc], DIST_EXT[D]);
-    }
-  }
-  bw.write(litCode.codes[256], litCode.lengths[256]);
-}
-
-
-// A copy of `freq` with every zero-frequency symbol raised to 1. The
-// DP cost tables are built from these: a symbol the previous parse never
-// used must still cost something, or the DP treats it as free and the
-// parse collapses into literals that cost nothing on paper but plenty in
-// the emitted stream. Emission still uses the raw frequencies.
-function smoothed(freq) {
-  const out = new Float64Array(freq.length);
-  for (let i = 0; i < freq.length; i++) out[i] = freq[i] === 0 ? 1 : freq[i];
-  return out;
-}
-
-function adler32(data) {
-  let a = 1, b = 0;
-  for (let i = 0; i < data.length;) {
-    const end = Math.min(data.length, i + 5552);
+  while (i < n) {
+    const end = Math.min(n, i + 5552);
     for (; i < end; i++) {
       a += data[i];
       b += a;
@@ -619,93 +68,829 @@ function adler32(data) {
   return ((b << 16) | a) >>> 0;
 }
 
-// The main entry: deflate `data` into a zlib stream.
-// opts: { chainCap, blocks, iterations }
-export function deflateZlib(data, opts = {}) {
-  const chainCap = opts.chainCap ?? 1024;
-  const nBlocks = opts.blocks ?? 8;
-  const iterations = opts.iterations ?? 3;
+// ---- bit writer -----------------------------------------------------------
+
+export class BitWriter {
+  constructor(capacity) {
+    this.buf = new Uint8Array(Math.max(1024, capacity));
+    this.pos = 0; // bytes written
+    this.acc = 0; // pending bits, LSB first
+    this.nbits = 0;
+  }
+  grow(need) {
+    if (this.pos + need + 8 > this.buf.length) {
+      const next = new Uint8Array(Math.max(this.buf.length * 2, this.pos + need + 1024));
+      next.set(this.buf.subarray(0, this.pos));
+      this.buf = next;
+    }
+  }
+  put(code, len) {
+    this.acc |= code << this.nbits;
+    this.nbits += len;
+    while (this.nbits >= 8) {
+      this.grow(1);
+      this.buf[this.pos++] = this.acc & 0xff;
+      this.acc >>>= 8;
+      this.nbits -= 8;
+    }
+  }
+  putReversed(code, len) {
+    // Put `len` bits of `code`, most-significant bit first (Huffman codes).
+    let rev = 0;
+    for (let i = 0; i < len; i++) rev = (rev << 1) | ((code >>> i) & 1);
+    this.put(rev, len);
+  }
+  align() {
+    if (this.nbits > 0) {
+      this.grow(1);
+      this.buf[this.pos++] = this.acc & 0xff;
+      this.acc = 0;
+      this.nbits = 0;
+    }
+  }
+  bytes() {
+    this.align();
+    return this.buf.subarray(0, this.pos);
+  }
+  get length() {
+    return this.pos + (this.nbits > 0 ? 1 : 0);
+  }
+}
+
+// ---- Huffman codes --------------------------------------------------------
+
+/** Length-limited code lengths from symbol frequencies (package-merge).
+ * Lists are built level by level: each level merges the two lightest items
+ * of the current list, pair by pair, into the next list, then the singletons
+ * join it; after maxBits levels the n-1 lightest items of the last list are
+ * kept, and a symbol's code length is how many of them contain it. */
+export function packageMerge(freqs, maxBits) {
+  const n = freqs.length;
+  const lengths = new Int16Array(n);
+  const live = [];
+  for (let s = 0; s < n; s++) if (freqs[s] > 0) live.push(s);
+  if (live.length === 0) return lengths;
+  if (live.length === 1) {
+    lengths[live[0]] = 1;
+    return lengths;
+  }
+  if (live.length === 2) {
+    lengths[live[0]] = 1;
+    lengths[live[1]] = 1;
+    return lengths;
+  }
+  const singletons = live
+    .map((s) => ({ w: freqs[s], syms: [s] }))
+    .sort((a, b) => a.w - b.w);
+  const L = Math.min(maxBits, live.length - 1);
+  let cur = singletons;
+  for (let level = 0; level < L; level++) {
+    // Pair adjacent items of the sorted list into the next list.
+    const next = [];
+    for (let i = 0; i + 1 < cur.length; i += 2) {
+      next.push({ w: cur[i].w + cur[i + 1].w, syms: cur[i].syms.concat(cur[i + 1].syms) });
+    }
+    if (level + 1 < L) {
+      // The singletons join the next list; keep it sorted by weight.
+      const merged = [];
+      let a = 0;
+      let b = 0;
+      while (a < singletons.length || b < next.length) {
+        if (b >= next.length || (a < singletons.length && singletons[a].w <= next[b].w)) merged.push(singletons[a++]);
+        else merged.push(next[b++]);
+      }
+      cur = merged;
+    } else {
+      cur = next;
+    }
+  }
+  const selected = cur.slice(0, live.length - 1);
+  for (const item of selected) for (const s of item.syms) lengths[s]++;
+  return lengths;
+}
+
+/** Canonical Huffman codes from code lengths: { codes, lengths }. */
+export function canonicalCodes(lengths) {
+  const n = lengths.length;
+  const codes = new Int32Array(n);
+  const blCount = new Int32Array(16);
+  for (let s = 0; s < n; s++) if (lengths[s] > 0) blCount[lengths[s]]++;
+  let code = 0;
+  const next = new Int32Array(16);
+  for (let b = 1; b < 16; b++) {
+    code = (code + blCount[b - 1]) << 1;
+    next[b] = code;
+  }
+  for (let s = 0; s < n; s++) {
+    const len = lengths[s];
+    if (len > 0) codes[s] = next[len]++;
+  }
+  return { codes, lengths };
+}
+
+/** Bit cost of every literal/length symbol under a code-length table. */
+export function symbolCosts(lengths) {
+  const c = new Float64Array(lengths.length);
+  for (let s = 0; s < lengths.length; s++) c[s] = lengths[s] === 0 ? 1e9 : lengths[s];
+  return c;
+}
+
+// ---- zlib fallback ----------------------------------------------------------
+
+/** zlib level-9 stream of raw bytes (used as a fallback / yardstick). */
+export function zlib9(data) {
+  const out = deflateSync(data, { level: 9, memLevel: 9 });
+  return new Uint8Array(out.buffer, out.byteOffset, out.length);
+}
+
+// ---- match search ---------------------------------------------------------
+
+// Length of the match between data[a..] and data[b..], at most maxLen.
+// Word-at-a-time via u32 when the offsets are congruent mod 4.
+function matchLength(data, a, b, maxLen, u32) {
+  let l = 0;
+  if (u32 !== null && ((a - b) & 3) === 0 && maxLen >= 4) {
+    while (l < maxLen && ((a + l) & 3) !== 0) {
+      if (data[a + l] !== data[b + l]) return l;
+      l++;
+    }
+    const aw = (a + l) >> 2;
+    const bw = (b + l) >> 2;
+    const words = (maxLen - l) >> 2;
+    let w = 0;
+    while (w < words && u32[aw + w] === u32[bw + w]) w++;
+    l += w * 4;
+  }
+  while (l < maxLen && data[a + l] === data[b + l]) l++;
+  return l;
+}
+
+// Insert one (len, dist) pair into a Pareto frontier list (at most 32 pairs):
+// a pair is kept only when no other pair is both at least as long and at
+// least as near; pairs it dominates are dropped.
+function addPair(list, len, dist) {
+  for (let i = 0; i < list.length; i++) {
+    if (list[i][0] >= len && list[i][1] <= dist) return;
+  }
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (list[i][0] <= len && list[i][1] >= dist) list.splice(i, 1);
+  }
+  list.push([len, dist]);
+  if (list.length > 32) {
+    let worst = 0;
+    for (let i = 1; i < list.length; i++) {
+      const l = list[i][0];
+      const d = list[i][1];
+      const wl = list[worst][0];
+      const wd = list[worst][1];
+      if (l < wl || (l === wl && d > wd)) worst = i;
+    }
+    list.splice(worst, 1);
+  }
+}
+
+// Find match candidates at every position of `data`, with two hash chains:
+// a 3-byte chain (16-bit table) walked only a short way — length-3 matches
+// pay only up close — and a 4-byte chain (18-bit table) walked far, which
+// stays cheap because 4-byte patterns collide far less. The 3-byte walk runs
+// first so near short matches are recorded before a long match raises the
+// bar. `chainCap` bounds the 4-byte walk, `cap3` the 3-byte walk.
+//   rowStride: distance of the row directly above (0 = unknown); a vertical
+//     candidate from the previous row is added at every position.
+// Returns { off, lens, dists }: for position p, the expanded (len, dist)
+// candidates are lens[off[p]..off[p+1]], dists[off[p]..off[p+1]]. Expansion
+// turns each frontier pair (L, D) into the lengths L, 3 and the base of L's
+// length-code range, so the DP can also start shorter matches at that distance.
+export function findMatches(data, chainCap, rowStride = 0, stallLimit = 1000000, cap3 = 32) {
   const n = data.length;
-  if (n === 0) {
-    return new Uint8Array([0x78, 0x01, 0x01, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01]);
-  }
-  const frontiers = findFrontiers(data, chainCap);
-  const blockLen = Math.ceil(n / nBlocks);
-  const mainBw = new BitWriter(n * 2 + 8192);
-  for (let b = 0; b < nBlocks; b++) {
-    const start = b * blockLen;
-    if (start >= n) break;
-    const end = Math.min(n, start + blockLen);
-    const isLast = end >= n;
-    // Iterate: fixed costs, then rebuild tables from each parse. The
-    // final pass expands matches to length-code range endpoints so the
-    // parse can end a match early for alignment.
-    let litLen = FIXED_LIT_LEN;
-    let distLen = FIXED_DIST_LEN;
-    let parsed = null;
-    for (let it = 0; it < iterations; it++) {
-      const tables = costTables(litLen, distLen);
-      parsed = parseBlock(data, start, end, frontiers, tables, it === iterations - 1);
-      if (it === iterations - 1) break;
-      const { litFreq, distFreq } = frequencies(parsed.symLit, parsed.symLen, parsed.symDist, parsed.nSym);
-      litLen = buildLengths(smoothed(litFreq), 15);
-      distLen = buildLengths(smoothed(distFreq), 15);
-      // A dynamic block needs at least two lit codes and one dist code;
-      // buildLengths already guarantees this for used alphabets, but an
-      // all-literal block has a single dist symbol (code 0) with freq 0:
-      // give it a second code so the header stays valid.
-      let dl = 0;
-      for (let k = 0; k < 30; k++) if (distLen[k] > 0) dl++;
-      if (dl === 0) distLen[0] = 1;
-      if (dl === 1) {
-        let other = -1;
-        for (let k = 1; k < 30; k++) if (distLen[k] === 0) { other = k; break; }
-        if (other >= 0) distLen[other] = 1;
+  const u32 = data.byteOffset % 4 === 0 ? new Uint32Array(data.buffer, data.byteOffset, n >> 2) : null;
+  const head3 = new Int32Array(1 << 16).fill(-1);
+  const prev3 = new Int32Array(n).fill(-1);
+  const head4 = new Int32Array(1 << 18).fill(-1);
+  const prev4 = new Int32Array(n).fill(-1);
+  // Raw Pareto frontier pairs per position; expansion into (len, dist)
+  // candidates happens later in expandCands (cheap everywhere, rich at
+  // chosen positions), so the match search runs only once.
+  const pairOff = new Int32Array(n + 1);
+  let cap = 1 << 20;
+  let pairLens = new Uint16Array(cap);
+  let pairDists = new Uint16Array(cap);
+  let count = 0;
+  const pushPair = (len, dist) => {
+    if (count >= cap) {
+      cap *= 2;
+      const nl = new Uint16Array(cap);
+      nl.set(pairLens);
+      pairLens = nl;
+      const nd = new Uint16Array(cap);
+      nd.set(pairDists);
+      pairDists = nd;
+    }
+    pairLens[count] = len;
+    pairDists[count] = dist;
+    count++;
+  };
+  const frontier = [];
+  // Walk one hash chain from its head, collecting Pareto pairs into the
+  // shared frontier. Chains run newest-first, so a later entry is always
+  // farther: once a length is beaten, only longer matches can still help,
+  // which the byte-at-best check enforces. `best` / `bestDist` are shared
+  // across the two walks at one position.
+  let best = 2;
+  let bestDist = 0;
+  const walk = (headArr, prevArr, h, cap, maxLen, oldest, p) => {
+    let cur = headArr[h];
+    let steps = 0;
+    let sinceImprove = 0;
+    while (cur >= oldest && cur >= 0 && steps < cap) {
+      steps++;
+      const dist = p - cur;
+      if (best < maxLen && data[cur + best] === data[p + best] && (best < 8 || data[cur + best - 8] === data[p + best - 8])) {
+        const len = matchLength(data, p, cur, maxLen, u32);
+        if (len > best) {
+          best = len;
+          bestDist = dist;
+          sinceImprove = 0;
+          addPair(frontier, len, dist);
+          if (len >= maxLen) break;
+        } else {
+          sinceImprove++;
+        }
+      } else if (best === 2) {
+        // No long match yet: still measure short ones (length 3 matters).
+        const len = matchLength(data, p, cur, Math.min(4, maxLen), u32);
+        if (len >= 3) {
+          best = len;
+          bestDist = dist;
+          sinceImprove = 0;
+          addPair(frontier, len, dist);
+        } else {
+          sinceImprove++;
+        }
+      } else {
+        sinceImprove++;
       }
-      let ll = 0;
-      for (let k = 0; k < 288; k++) if (litLen[k] > 0) ll++;
-      if (ll === 1) {
-        for (let k = 0; k < 288; k++) if (litLen[k] === 0) { litLen[k] = 1; break; }
+      if (sinceImprove >= stallLimit) break;
+      cur = prevArr[cur];
+    }
+  };
+  for (let p = 0; p < n; p++) {
+    if (p + 3 <= n) {
+      const maxLen = Math.min(258, n - p);
+      const oldest = p - 32768;
+      best = 2;
+      bestDist = 0;
+      frontier.length = 0;
+      const h3 = ((data[p] << 10) ^ (data[p + 1] << 5) ^ data[p + 2]) & 0xffff;
+      // Short walk: only length-3 matches live here (anything longer shares
+      // 4 bytes and the 4-byte walk measures it), so three inline byte
+      // checks replace matchLength entirely.
+      let cur3 = head3[h3];
+      let steps3 = 0;
+      while (cur3 >= oldest && cur3 >= 0 && steps3 < cap3) {
+        steps3++;
+        const dist = p - cur3;
+        if (data[cur3] === data[p] && data[cur3 + 1] === data[p + 1] && data[cur3 + 2] === data[p + 2]) {
+          const longer = p + 4 <= n && data[cur3 + 3] === data[p + 3];
+          if (!longer && best < 3) {
+            best = 3;
+            bestDist = dist;
+            addPair(frontier, 3, dist);
+          }
+        }
+        cur3 = prev3[cur3];
+      }
+      if (p + 4 <= n && best < maxLen) {
+        const h4 = ((((data[p] * 31 + data[p + 1]) * 31 + data[p + 2]) * 31 + data[p + 3]) & 0x3ffff);
+        walk(head4, prev4, h4, chainCap, maxLen, oldest, p);
+      }
+      // Vertical candidate: the same column one row up.
+      if (rowStride > 0 && p >= rowStride) {
+        const len = matchLength(data, p, p - rowStride, maxLen, u32);
+        if (len >= 3) {
+          addPair(frontier, len, rowStride);
+          if (len > best) {
+            best = len;
+            bestDist = rowStride;
+          }
+        }
+      }
+      // Store the raw frontier pairs; expansion is expandCands' job.
+      for (let i = 0; i < frontier.length; i++) pushPair(frontier[i][0], frontier[i][1]);
+      prev3[p] = head3[h3];
+      head3[h3] = p;
+      if (p + 4 <= n) {
+        const h4 = ((((data[p] * 31 + data[p + 1]) * 31 + data[p + 2]) * 31 + data[p + 3]) & 0x3ffff);
+        prev4[p] = head4[h4];
+        head4[h4] = p;
       }
     }
-    const { litFreq, distFreq } = frequencies(parsed.symLit, parsed.symLen, parsed.symDist, parsed.nSym);
-    const finLitLen = buildLengths(litFreq, 15);
-    const finDistLen = buildLengths(distFreq, 15);
-    let dl = 0;
-    for (let k = 0; k < 30; k++) if (finDistLen[k] > 0) dl++;
-    if (dl === 0) finDistLen[0] = 1;
-    if (dl === 1) {
-      for (let k = 1; k < 30; k++) if (finDistLen[k] === 0) { finDistLen[k] = 1; break; }
-    }
-    let ll = 0;
-    for (let k = 0; k < 288; k++) if (finLitLen[k] > 0) ll++;
-    if (ll === 1) {
-      for (let k = 0; k < 288; k++) if (finLitLen[k] === 0) { finLitLen[k] = 1; break; }
-    }
-    const litCode = canonicalCodes(finLitLen);
-    const distCode = canonicalCodes(finDistLen);
-    // Emit dynamic and fixed into trial writers, keep the smaller by bits.
-    // finish() flushes each trial writer's pending partial byte into its
-    // buffer before append() reads it.
-    const cap = (end - start) * 2 + 8192;
-    const bwDyn = new BitWriter(cap);
-    emitBlock(bwDyn, parsed.symLit, parsed.symLen, parsed.symDist, parsed.nSym, litCode, distCode, isLast);
-    bwDyn.finish();
-    const bwFix = new BitWriter(cap);
-    emitFixedBlock(bwFix, parsed.symLit, parsed.symLen, parsed.symDist, parsed.nSym, isLast);
-    bwFix.finish();
-    mainBw.append(bwDyn.bitLen <= bwFix.bitLen ? bwDyn : bwFix);
+    pairOff[p + 1] = count;
   }
-  const deflated = mainBw.finish();
-  const total = 2 + deflated.length + 4;
-  const out = new Uint8Array(total);
-  out[0] = 0x78;
-  out[1] = 0x9c;
-  out.set(deflated, 2);
-  const ad = adler32(data);
-  out[2 + deflated.length] = (ad >>> 24) & 0xff;
-  out[3 + deflated.length] = (ad >>> 16) & 0xff;
-  out[4 + deflated.length] = (ad >>> 8) & 0xff;
-  out[5 + deflated.length] = ad & 0xff;
+  return { pairOff, pairLens: pairLens.subarray(0, count), pairDists: pairDists.subarray(0, count) };
+}
+
+// Length-code range tops: the longest length in each range. A match of
+// length L at distance D can be truncated to any top <= L at the same
+// distance, letting the DP stop a long match early to start a better one.
+const TOPS = [3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 18, 22, 26, 30, 34, 42, 50, 58, 66, 82, 98, 114, 130, 162, 194, 226, 257, 258];
+
+// Expand raw frontier pairs into (len, dist) candidates. Every pair
+// contributes its length L, length 3, and the base of L's length-code
+// range. At positions where `rich` is set, the longest pair additionally
+// contributes every range top <= L (the truncation options).
+export function expandCands(pairs, rich) {
+  const n = pairs.pairOff.length - 1;
+  const off = new Int32Array(n + 1);
+  let cap = 1 << 20;
+  let lens = new Uint16Array(cap);
+  let dists = new Uint16Array(cap);
+  let count = 0;
+  const push = (len, dist) => {
+    if (count >= cap) {
+      cap *= 2;
+      const nl = new Uint16Array(cap);
+      nl.set(lens);
+      lens = nl;
+      const nd = new Uint16Array(cap);
+      nd.set(dists);
+      dists = nd;
+    }
+    lens[count] = len;
+    dists[count] = dist;
+    count++;
+  };
+  for (let p = 0; p < n; p++) {
+    const s = pairs.pairOff[p];
+    const e = pairs.pairOff[p + 1];
+    if (e > s && rich !== null && rich[p]) {
+      let maxL = 0;
+      for (let i = s; i < e; i++) if (pairs.pairLens[i] > maxL) maxL = pairs.pairLens[i];
+      for (let i = s; i < e; i++) {
+        const L = pairs.pairLens[i];
+        const D = pairs.pairDists[i];
+        push(L, D);
+        if (L !== 3) {
+          push(3, D);
+          if (L === maxL) {
+            for (let t = 0; t < TOPS.length; t++) {
+              const top = TOPS[t];
+              if (top >= L) break;
+              if (top > 3) push(top, D);
+            }
+          } else {
+            const base = LEN_BASE[LEN_SYM[L] - 257];
+            if (base !== 3 && base !== L) push(base, D);
+          }
+        }
+      }
+    } else {
+      for (let i = s; i < e; i++) {
+        const L = pairs.pairLens[i];
+        const D = pairs.pairDists[i];
+        push(L, D);
+        if (L !== 3) {
+          push(3, D);
+          const base = LEN_BASE[LEN_SYM[L] - 257];
+          if (base !== 3 && base !== L) push(base, D);
+        }
+      }
+    }
+    off[p + 1] = count;
+  }
+  return { off, lens: lens.subarray(0, count), dists: dists.subarray(0, count) };
+}
+
+// ---- optimal parse --------------------------------------------------------
+
+// Cost tables from code lengths: literal costs, per-length match costs and
+// per-distance match costs (symbol cost plus extra bits).
+function costTables(litLen, distLen) {
+  const litCost = new Float64Array(288);
+  for (let s = 0; s < 288; s++) litCost[s] = litLen[s] === 0 ? 1e9 : litLen[s];
+  const lenCost = new Float64Array(259);
+  for (let l = 3; l <= 258; l++) {
+    const sym = LEN_SYM[l];
+    lenCost[l] = litCost[sym] + LEN_EXTRA[sym - 257];
+  }
+  const distCost = new Float64Array(32769);
+  for (let d = 1; d <= 32768; d++) {
+    const sym = DIST_SYM[d];
+    distCost[d] = (distLen[sym] === 0 ? 1e9 : distLen[sym]) + DIST_EXTRA[sym];
+  }
+  return { litCost, lenCost, distCost };
+}
+
+// One forward DP pass over [from, to): fills costBuf and the back-pointers,
+// then backtracks into op arrays. Returns { len, dist, pos, count, bits }.
+export function dpParse(data, cands, from, to, litCost, lenCost, distCost, scratch) {
+  const { cost, prevLen, prevDist } = scratch;
+  cost.fill(Infinity, from, to + 1);
+  cost[from] = 0;
+  for (let p = from; p < to; p++) {
+    const c = cost[p];
+    if (c === Infinity) continue;
+    const lc = c + litCost[data[p]];
+    if (lc < cost[p + 1]) {
+      cost[p + 1] = lc;
+      prevLen[p + 1] = 1;
+      prevDist[p + 1] = 0;
+    }
+    const s = cands.off[p];
+    const e = cands.off[p + 1];
+    for (let i = s; i < e; i++) {
+      const len = cands.lens[i];
+      const end = p + len;
+      if (end > to) continue;
+      const mc = c + lenCost[len] + distCost[cands.dists[i]];
+      if (mc < cost[end]) {
+        cost[end] = mc;
+        prevLen[end] = len;
+        prevDist[end] = cands.dists[i];
+      }
+    }
+  }
+  const bits = cost[to];
+  // Backtrack.
+  const lenArr = new Int32Array(to - from + 1);
+  const distArr = new Int32Array(to - from + 1);
+  const posArr = new Int32Array(to - from + 1);
+  let count = 0;
+  let p = to;
+  while (p > from) {
+    const len = prevLen[p];
+    const dist = prevDist[p];
+    lenArr[count] = len;
+    distArr[count] = dist;
+    posArr[count] = p - len;
+    count++;
+    p -= len;
+  }
+  // Reverse into forward order.
+  const opsLen = new Int32Array(count);
+  const opsDist = new Int32Array(count);
+  const opsPos = new Int32Array(count);
+  for (let i = 0; i < count; i++) {
+    opsLen[i] = lenArr[count - 1 - i];
+    opsDist[i] = distArr[count - 1 - i];
+    opsPos[i] = posArr[count - 1 - i];
+  }
+  return { opsLen, opsDist, opsPos, count, bits };
+}
+
+// Symbol frequencies of a parse: literal/length symbols 0..285 and distance
+// symbols 0..29 (a match of length 3..258 also counts its length symbol).
+export function parseFreqs(data, ops, litFreq, distFreq) {
+  litFreq.fill(0);
+  distFreq.fill(0);
+  const { opsLen, opsDist, opsPos, count } = ops;
+  for (let i = 0; i < count; i++) {
+    const len = opsLen[i];
+    if (len === 1) {
+      litFreq[data[opsPos[i]]]++;
+    } else {
+      litFreq[LEN_SYM[len]]++;
+      distFreq[DIST_SYM[opsDist[i]]]++;
+    }
+  }
+  litFreq[256]++; // end of block
+}
+
+// Run the DP `iterations` times, rebuilding the Huffman tables from each
+// parse's frequencies. Starts from `initLitLen` / `initDistLen` (fixed
+// tables when omitted). Returns the final parse plus its code lengths.
+export function refineParse(data, cands, from, to, iterations, scratch, initLitLen = null, initDistLen = null) {
+  let litLen = initLitLen === null ? FIXED_LIT_LEN : initLitLen;
+  let distLen = initDistLen === null ? FIXED_DIST_LEN : initDistLen;
+  let ops = null;
+  const litFreq = new Int32Array(288);
+  const distFreq = new Int32Array(32);
+  for (let it = 0; it < iterations; it++) {
+    const { litCost, lenCost, distCost } = costTables(litLen, distLen);
+    ops = dpParse(data, cands, from, to, litCost, lenCost, distCost, scratch);
+    parseFreqs(data, ops, litFreq, distFreq);
+    litLen = packageMerge(litFreq, 15);
+    distLen = packageMerge(distFreq, 15);
+  }
+  return { ops, litLen, distLen };
+}
+
+// ---- block splitting ------------------------------------------------------
+
+// f * log2(f), tabulated so the split search never calls Math.log2 per op.
+const LOGMUL = (() => {
+  const t = new Float64Array(1 << 20);
+  for (let i = 2; i < t.length; i++) t[i] = i * Math.log2(i);
+  return t;
+})();
+const flog = (f) => (f < LOGMUL.length ? LOGMUL[f] : f * Math.log2(f));
+
+// Choose block boundaries for a parse, by a DP over a coarse grid of op
+// starts (every `gridBytes` input bytes, snapped to op starts). The cost of
+// a segment is its Shannon entropy under its own symbol frequencies, plus
+// the match extra bits, plus a dynamic-header estimate — so a boundary pays
+// only where the local statistics actually change. Returns input offsets
+// (op starts) of the chosen splits, between 0 and n exclusive.
+export function chooseSplits(data, ops, gridBytes, maxBlocks, headerBits = 240) {
+  const { opsLen, opsDist, opsPos, count } = ops;
+  if (count < 2) return [];
+  // Candidate boundary op indices: 0, count, and the first op at or after
+  // each grid multiple.
+  const bnd = [0];
+  let next = gridBytes;
+  for (let i = 1; i < count; i++) {
+    if (opsPos[i] >= next) {
+      bnd.push(i);
+      next += gridBytes;
+    }
+  }
+  bnd.push(count);
+  const B = bnd.length;
+  const isBnd = new Int32Array(count + 1).fill(-1);
+  for (let j = 0; j < B; j++) isBnd[bnd[j]] = j;
+  const dp = new Float64Array(B).fill(Infinity);
+  const prev = new Int32Array(B).fill(-1);
+  dp[0] = 0;
+  const litFreq = new Int32Array(288);
+  const distFreq = new Int32Array(32);
+  const litFl = new Float64Array(288);
+  const distFl = new Float64Array(32);
+  for (let i = 0; i < B - 1; i++) {
+    if (dp[i] === Infinity) continue;
+    litFreq.fill(0);
+    distFreq.fill(0);
+    litFl.fill(0);
+    distFl.fill(0);
+    let sumLit = 0;
+    let sumDist = 0;
+    let totLit = 0;
+    let totDist = 0;
+    let distinctLit = 0;
+    let distinctDist = 0;
+    let extra = 0;
+    const start = bnd[i];
+    for (let k = start; k < count; k++) {
+      const len = opsLen[k];
+      if (len === 1) {
+        const s = data[opsPos[k]];
+        const f = litFreq[s];
+        if (f === 0) distinctLit++;
+        const nf = flog(f + 1);
+        sumLit += nf - litFl[s];
+        litFl[s] = nf;
+        litFreq[s] = f + 1;
+        totLit++;
+      } else {
+        const s = LEN_SYM[len];
+        const f = litFreq[s];
+        if (f === 0) distinctLit++;
+        const nf = flog(f + 1);
+        sumLit += nf - litFl[s];
+        litFl[s] = nf;
+        litFreq[s] = f + 1;
+        totLit++;
+        const ds = DIST_SYM[opsDist[k]];
+        const df = distFreq[ds];
+        if (df === 0) distinctDist++;
+        const ndf = flog(df + 1);
+        sumDist += ndf - distFl[ds];
+        distFl[ds] = ndf;
+        distFreq[ds] = df + 1;
+        totDist++;
+        extra += LEN_EXTRA[s - 257] + DIST_EXTRA[ds];
+      }
+      const j = isBnd[k + 1];
+      if (j > 0) {
+        const litBits = totLit > 0 ? totLit * Math.log2(totLit) - sumLit : 0;
+        const distBits = totDist > 0 ? totDist * Math.log2(totDist) - sumDist : 0;
+        const seg = litBits + distBits + extra + headerBits + 4 * (distinctLit + distinctDist);
+        const tot = dp[i] + seg;
+        if (tot < dp[j]) {
+          dp[j] = tot;
+          prev[j] = i;
+        }
+      }
+    }
+  }
+  // Backtrack into split op indices, then input offsets.
+  const splits = [];
+  let j = B - 1;
+  while (j > 0) {
+    const i = prev[j];
+    if (i < 0) break;
+    if (i > 0) splits.push(bnd[i]);
+    j = i;
+  }
+  splits.reverse();
+  let offsets = splits.map((oi) => opsPos[oi]);
+  if (offsets.length > maxBlocks - 1) {
+    // Too many blocks: keep an evenly spaced subset of the chosen splits.
+    const keep = [];
+    const step = offsets.length / (maxBlocks - 1);
+    for (let t = 0; t < maxBlocks - 1; t++) keep.push(offsets[Math.floor(t * step)]);
+    offsets = [...new Set(keep)].sort((a, b) => a - b);
+  }
+  return offsets;
+}
+
+// ---- emission -------------------------------------------------------------
+
+const CL_ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+
+// Run-length encoding of a code-length sequence into [symbol, extra, bits].
+function rleLengths(lens) {
+  const out = [];
+  let i = 0;
+  const n = lens.length;
+  while (i < n) {
+    const v = lens[i];
+    let run = 1;
+    while (i + run < n && lens[i + run] === v) run++;
+    if (v === 0) {
+      let r = run;
+      while (r >= 11) {
+        const t = Math.min(r, 138);
+        out.push([18, t - 11, 7]);
+        r -= t;
+      }
+      if (r >= 3) {
+        out.push([17, r - 3, 3]);
+        r = 0;
+      }
+      while (r > 0) {
+        out.push([0, 0, 0]);
+        r--;
+      }
+    } else {
+      out.push([v, 0, 0]);
+      let r = run - 1;
+      while (r >= 3) {
+        const t = Math.min(r, 6);
+        out.push([16, t - 3, 2]);
+        r -= t;
+      }
+      while (r > 0) {
+        out.push([v, 0, 0]);
+        r--;
+      }
+    }
+    i += run;
+  }
   return out;
+}
+
+// Write a dynamic Huffman header for litLen/distLen into bw.
+function writeDynamicHeader(bw, litLen, distLen) {
+  let nLit = 257;
+  for (let s = 287; s >= 257; s--) {
+    if (litLen[s] > 0) {
+      nLit = s + 1;
+      break;
+    }
+  }
+  let nDist = 1;
+  for (let s = 31; s >= 1; s--) {
+    if (distLen[s] > 0) {
+      nDist = s + 1;
+      break;
+    }
+  }
+  const all = new Int16Array(nLit + nDist);
+  all.set(litLen.subarray(0, nLit), 0);
+  all.set(distLen.subarray(0, nDist), nLit);
+  const rle = rleLengths(all);
+  const clFreq = new Int32Array(19);
+  for (let i = 0; i < rle.length; i++) clFreq[rle[i][0]]++;
+  const clLen = packageMerge(clFreq, 7);
+  let nCl = 4;
+  for (let i = 18; i >= 4; i--) {
+    if (clLen[CL_ORDER[i]] > 0) {
+      nCl = i + 1;
+      break;
+    }
+  }
+  bw.put(nLit - 257, 5);
+  bw.put(nDist - 1, 5);
+  bw.put(nCl - 4, 4);
+  for (let i = 0; i < nCl; i++) bw.put(clLen[CL_ORDER[i]], 3);
+  const clCodes = canonicalCodes(clLen).codes;
+  for (let i = 0; i < rle.length; i++) {
+    const [sym, extra, ebits] = rle[i];
+    bw.putReversed(clCodes[sym], clLen[sym]);
+    if (ebits > 0) bw.put(extra, ebits);
+  }
+}
+
+// Exact bit length of a dynamic header (measured by writing it to scratch).
+function dynamicHeaderBits(litLen, distLen) {
+  const scratch = new BitWriter(1024);
+  writeDynamicHeader(scratch, litLen, distLen);
+  return scratch.pos * 8 + scratch.nbits;
+}
+
+// Exact body bits of a parse under a code-length pair (ops + end-of-block).
+function bodyBits(data, ops, litLen, distLen) {
+  const { opsLen, opsDist, opsPos, count } = ops;
+  let bits = litLen[256];
+  for (let i = 0; i < count; i++) {
+    const len = opsLen[i];
+    if (len === 1) {
+      bits += litLen[data[opsPos[i]]];
+    } else {
+      const lsym = LEN_SYM[len];
+      bits += litLen[lsym] + LEN_EXTRA[lsym - 257];
+      const dsym = DIST_SYM[opsDist[i]];
+      bits += distLen[dsym] + DIST_EXTRA[dsym];
+    }
+  }
+  return bits;
+}
+
+// Write a parse's ops into bw under the given codes.
+function writeOps(bw, data, ops, litCodes, litLen, distCodes, distLen) {
+  const { opsLen, opsDist, opsPos, count } = ops;
+  for (let i = 0; i < count; i++) {
+    const len = opsLen[i];
+    if (len === 1) {
+      const s = data[opsPos[i]];
+      bw.putReversed(litCodes[s], litLen[s]);
+    } else {
+      const lsym = LEN_SYM[len];
+      bw.putReversed(litCodes[lsym], litLen[lsym]);
+      const le = LEN_EXTRA[lsym - 257];
+      if (le > 0) bw.put(len - LEN_BASE[lsym - 257], le);
+      const dsym = DIST_SYM[opsDist[i]];
+      bw.putReversed(distCodes[dsym], distLen[dsym]);
+      const de = DIST_EXTRA[dsym];
+      if (de > 0) bw.put(opsDist[i] - DIST_BASE[dsym], de);
+    }
+  }
+  bw.putReversed(litCodes[256], litLen[256]);
+}
+
+// ---- top level ------------------------------------------------------------
+
+// Compress `data` into a zlib stream: optimal-parse DEFLATE with adaptive
+// multi-block output and per-block tables, or zlib level 9, whichever is
+// smaller. opts: { chainCap, rowStride, globalIters, blockIters, maxBlocks }.
+export function compressZlib(data, opts = {}) {
+  const n = data.length;
+  const z9 = zlib9(data);
+  if (n < 1024) return z9;
+  const chainCap = opts.chainCap ?? (n > 1000000 ? 128 : n > 200000 ? 256 : n > 50000 ? 512 : 1024);
+  const rowStride = opts.rowStride ?? 0;
+  const pairs = findMatches(data, chainCap, rowStride, opts.stallLimit ?? 1000000, opts.cap3 ?? 32);
+  const scratch = {
+    cost: new Float64Array(n + 1),
+    prevLen: new Uint16Array(n + 1),
+    prevDist: new Uint16Array(n + 1),
+  };
+  const globalIters = opts.globalIters ?? 2;
+  const blockIters = opts.blockIters ?? 3;
+  // Phase 1: cheap expansion, global parse. Its match starts are the
+  // positions where a long match may want truncating, so phase 2 expands
+  // richly only there and cheaply everywhere else.
+  const cands = expandCands(pairs, null);
+  const g = refineParse(data, cands, 0, n, globalIters, scratch);
+  const gridBytes = rowStride > 0 ? rowStride * 16 : 32768;
+  const splits = chooseSplits(data, g.ops, gridBytes, opts.maxBlocks ?? 16);
+  const rich = new Uint8Array(n);
+  for (let i = 0; i < g.ops.count; i++) {
+    if (g.ops.opsLen[i] >= 3) rich[g.ops.opsPos[i]] = 1;
+  }
+  const candsRich = expandCands(pairs, rich);
+  const bounds = [0, ...splits, n];
+  const bw = new BitWriter(n);
+  const fixedLitCodes = canonicalCodes(FIXED_LIT_LEN).codes;
+  const fixedDistCodes = canonicalCodes(FIXED_DIST_LEN).codes;
+  for (let b = 0; b < bounds.length - 1; b++) {
+    const from = bounds[b];
+    const to = bounds[b + 1];
+    const last = b === bounds.length - 2;
+    const r = refineParse(data, candsRich, from, to, blockIters, scratch, g.litLen, g.distLen);
+    const dynBits = 3 + dynamicHeaderBits(r.litLen, r.distLen) + bodyBits(data, r.ops, r.litLen, r.distLen);
+    const fixBits = 3 + bodyBits(data, r.ops, FIXED_LIT_LEN, FIXED_DIST_LEN);
+    bw.put(last ? 1 : 0, 1);
+    if (dynBits <= fixBits) {
+      bw.put(2, 2);
+      writeDynamicHeader(bw, r.litLen, r.distLen);
+      const dc = canonicalCodes(r.litLen).codes;
+      const dd = canonicalCodes(r.distLen).codes;
+      writeOps(bw, data, r.ops, dc, r.litLen, dd, r.distLen);
+    } else {
+      bw.put(1, 2);
+      writeOps(bw, data, r.ops, fixedLitCodes, FIXED_LIT_LEN, fixedDistCodes, FIXED_DIST_LEN);
+    }
+  }
+  const raw = bw.bytes();
+  const out = new Uint8Array(raw.length + 6);
+  out[0] = 0x78;
+  out[1] = 0xda;
+  out.set(raw, 2);
+  const ad = adler32(data);
+  out[out.length - 4] = (ad >>> 24) & 0xff;
+  out[out.length - 3] = (ad >>> 16) & 0xff;
+  out[out.length - 2] = (ad >>> 8) & 0xff;
+  out[out.length - 1] = ad & 0xff;
+  return out.length < z9.length ? out : z9;
 }
