@@ -387,8 +387,8 @@ export function fixedStream(cache, t) {
 
 /** Fixed work budgets by filtered-stream size: no clock, so the run is deterministic. */
 export function settingsFor(n) {
-  if (n <= 1500000) return { cap: 2048, iters: 3, mode: 'all', top2: true };
-  return { cap: 256, iters: 3, mode: 'good', top2: false };
+  if (n <= 1500000) return { cap: 1024, iters: 3, mode: 'all', top2gap: 1.05 };
+  return { cap: 256, iters: 3, mode: 'good', top2gap: 0 };
 }
 
 /**
@@ -438,15 +438,17 @@ export function refine(form, cache, minsum, width, height) {
   };
   let best = write(cands[0]);
   let bestStream = cands[0].stream;
-  // A second candidate is written when it can plausibly win: on the small
-  // streams whenever it is close by the level-6 screen, and on the large
-  // streams when the two candidates disagree about splitting — the split
-  // gain differs per stream, so the screen's ranking can flip there. On the
-  // large streams the screen's ranking otherwise already matches the
-  // optimal-parse ranking, so the second pass buys nothing.
-  const close = cands[1].z6 < cands[0].z6 * 1.05;
-  const splitDiffers = close && !s.top2 ? partsOf(cands[0]) !== partsOf(cands[1]) : false;
-  if (close && (s.top2 || splitDiffers)) {
+  // A second candidate is written when it can plausibly win. On the small
+  // streams, whenever it is close by the level-6 screen. On the large
+  // streams, when the two candidates are close and disagree about splitting,
+  // since the split gain differs per stream and the screen's ranking can flip
+  // there; the screen's ranking otherwise already matches the optimal-parse
+  // ranking, so the second pass buys nothing.
+  const closeSmall = s.top2gap > 0 && cands[1].z6 < cands[0].z6 * s.top2gap;
+  const splitDiffers = s.top2gap === 0 && cands[1].z6 < cands[0].z6 * 1.05
+    ? partsOf(cands[0]) !== partsOf(cands[1])
+    : false;
+  if (closeSmall || splitDiffers) {
     const second = write(cands[1]);
     if (second.bytes < best.bytes) { best = second; bestStream = cands[1].stream; }
   }
