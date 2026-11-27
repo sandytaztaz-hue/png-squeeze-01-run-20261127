@@ -387,7 +387,7 @@ export function fixedStream(cache, t) {
 
 /** Fixed work budgets by filtered-stream size: no clock, so the run is deterministic. */
 export function settingsFor(n) {
-  if (n <= 1500000) return { cap: 1024, iters: 3, mode: 'all', top2gap: 1.05 };
+  if (n <= 1500000) return { cap: 1024, iters: 3, mode: 'all', top2gap: 1.015 };
   return { cap: 256, iters: 3, mode: 'good', top2gap: 0 };
 }
 
